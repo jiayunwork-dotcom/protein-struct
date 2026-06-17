@@ -10,6 +10,17 @@ from .amino_acids import (
     encode_sequence_with_properties,
 )
 from .blosum62 import BLOSUM62, blosum62_score
+from .structure_propensities import (
+    CHOU_FASMAN,
+    PRIOR_PROBS,
+    CENTER_LLR,
+    POSITION_WEIGHT,
+    build_gor_probabilities_realistic,
+    build_nn_weights_biologically,
+    build_lstm_weights_biologically,
+    apply_structural_rules,
+    enhanced_chou_fasman_predict,
+)
 
 __all__ = [
     "AMINO_ACIDS",
@@ -23,4 +34,13 @@ __all__ = [
     "encode_sequence_blosum62",
     "encode_sequence_with_properties",
     "blosum62_score",
+    "CHOU_FASMAN",
+    "PRIOR_PROBS",
+    "CENTER_LLR",
+    "POSITION_WEIGHT",
+    "build_gor_probabilities_realistic",
+    "build_nn_weights_biologically",
+    "build_lstm_weights_biologically",
+    "apply_structural_rules",
+    "enhanced_chou_fasman_predict",
 ]
