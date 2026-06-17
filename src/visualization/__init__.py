@@ -4,6 +4,7 @@ from .structure import (
     plot_helix_length_distribution,
     plot_helical_wheel,
     plot_ramachandran,
+    plot_confidence_heatmap,
 )
 from .alignment_viz import (
     plot_alignment,
@@ -17,6 +18,7 @@ __all__ = [
     "plot_helix_length_distribution",
     "plot_helical_wheel",
     "plot_ramachandran",
+    "plot_confidence_heatmap",
     "plot_alignment",
     "COLOR_SCHEMES",
     "plot_sequence_logo",

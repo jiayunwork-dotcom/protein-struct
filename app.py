@@ -44,6 +44,7 @@ from src.visualization import (
     plot_helix_length_distribution,
     plot_helical_wheel,
     plot_ramachandran,
+    plot_confidence_heatmap,
     plot_alignment,
     plot_sequence_logo,
     COLOR_SCHEMES,
@@ -381,6 +382,78 @@ def page_prediction():
                             "P(C)": f"{res.probabilities[i, 2]:.3f}",
                         })
                     st.dataframe(pd.DataFrame(prob_data), use_container_width=True, hide_index=True)
+
+        if len(results) >= 2:
+            with st.expander("📊 置信度分析 (Confidence Analysis)", expanded=True):
+                hm_fig, conf_matrix, consensus_list, conf_stats = plot_confidence_heatmap(
+                    results, sequence_name=seq.name
+                )
+                if hm_fig.data:
+                    st.plotly_chart(hm_fig, use_container_width=True)
+
+                    stat_cols = st.columns(len(results) + 1)
+                    for m_idx, res in enumerate(results):
+                        with stat_cols[m_idx]:
+                            avg_c = conf_stats["avg_confidences"].get(res.method, 0)
+                            st.metric(
+                                label=res.method,
+                                value=f"{avg_c:.3f}",
+                                delta="avg confidence",
+                            )
+                    with stat_cols[len(results)]:
+                        st.metric(
+                            label="3-Method Agreement",
+                            value=f"{conf_stats['agreement_rate']:.1f}%",
+                            delta=f"{conf_stats['agreement_count']}/{conf_stats['seq_len']} positions",
+                        )
+
+                    st.markdown("---")
+                    st.markdown("**🔬 Residue Detail Explorer** — Select a position to inspect local context")
+                    seq_len = len(results[0])
+                    selected_pos = st.slider(
+                        "Residue Position:",
+                        min_value=1,
+                        max_value=seq_len,
+                        value=1,
+                        key=f"conf_pos_{sid}",
+                    )
+
+                    center = selected_pos - 1
+                    ctx_start = max(0, center - 5)
+                    ctx_end = min(seq_len, center + 6)
+                    local_seq = results[0].sequence[ctx_start:ctx_end]
+
+                    st.markdown(
+                        f"**Local Sequence** (positions {ctx_start + 1}–{ctx_end}): "
+                        f"`{''.join(local_seq)}`"
+                    )
+
+                    detail_rows = []
+                    for offset_i, pos_i in enumerate(range(ctx_start, ctx_end)):
+                        row = {
+                            "Residue": results[0].sequence[pos_i],
+                            "Position": pos_i + 1,
+                        }
+                        for res in results:
+                            h_p = res.probabilities[pos_i, 0] * 100
+                            e_p = res.probabilities[pos_i, 1] * 100
+                            c_p = res.probabilities[pos_i, 2] * 100
+                            row[f"{res.method}"] = (
+                                f"{res.states[pos_i]} "
+                                f"(H:{h_p:.1f}% E:{e_p:.1f}% C:{c_p:.1f}%)"
+                            )
+                        consensus_char = consensus_list[pos_i]
+                        if consensus_char != "?":
+                            row["Consensus"] = f"✅ {consensus_char}"
+                        else:
+                            row["Consensus"] = "❓ ?"
+                        detail_rows.append(row)
+
+                    st.dataframe(
+                        pd.DataFrame(detail_rows),
+                        use_container_width=True,
+                        hide_index=True,
+                    )
 
 
 def page_pairwise_alignment():

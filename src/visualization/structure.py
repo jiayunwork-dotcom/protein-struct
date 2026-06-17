@@ -357,6 +357,174 @@ def plot_helical_wheel(
     return fig
 
 
+def plot_confidence_heatmap(
+    results: List[PredictionResult],
+    sequence_name: str = "",
+) -> Tuple[go.Figure, np.ndarray, List[str], Dict]:
+    if not results or len(results) < 2:
+        return go.Figure(), np.zeros((0, 0)), [], {}
+
+    seq_len = len(results[0])
+    n_methods = len(results)
+    method_names = [r.method for r in results]
+
+    confidence_matrix = np.zeros((n_methods, seq_len), dtype=np.float64)
+    for i, res in enumerate(results):
+        sorted_probs = np.sort(res.probabilities, axis=1)
+        confidence_matrix[i] = sorted_probs[:, -1] - sorted_probs[:, -2]
+
+    consensus = []
+    for pos in range(seq_len):
+        preds_at_pos = [res.states[pos] for res in results]
+        if len(set(preds_at_pos)) == 1:
+            consensus.append(preds_at_pos[0])
+        else:
+            consensus.append("?")
+
+    agreement_count = sum(1 for c in consensus if c != "?")
+    agreement_rate = agreement_count / seq_len * 100 if seq_len > 0 else 0
+
+    avg_confidences = confidence_matrix.mean(axis=1).tolist()
+
+    stats = {
+        "avg_confidences": dict(zip(method_names, avg_confidences)),
+        "agreement_rate": agreement_rate,
+        "agreement_count": agreement_count,
+        "seq_len": seq_len,
+    }
+
+    y_labels = method_names + ["Consensus"]
+    z_data = np.vstack([confidence_matrix, np.zeros((1, seq_len))])
+
+    positions = list(range(1, seq_len + 1))
+
+    hover_text = []
+    for row_idx in range(n_methods):
+        row_text = []
+        for pos in range(seq_len):
+            aa = results[0].sequence[pos]
+            lines = [f"<b>Position {pos + 1} | {aa}</b>"]
+            for m_idx, res in enumerate(results):
+                h_pct = res.probabilities[pos, 0] * 100
+                e_pct = res.probabilities[pos, 1] * 100
+                c_pct = res.probabilities[pos, 2] * 100
+                lines.append(
+                    f"{res.method}: H={h_pct:.1f}% E={e_pct:.1f}% C={c_pct:.1f}% → {res.states[pos]}"
+                )
+            lines.append(f"Confidence: {confidence_matrix[row_idx, pos]:.3f}")
+            row_text.append("<br>".join(lines))
+        hover_text.append(row_text)
+
+    consensus_hover = []
+    for pos in range(seq_len):
+        aa = results[0].sequence[pos]
+        lines = [f"<b>Position {pos + 1} | {aa}</b>"]
+        for m_idx, res in enumerate(results):
+            lines.append(f"{res.method}: {res.states[pos]}")
+        lines.append(f"Consensus: {consensus[pos]}")
+        consensus_hover.append("<br>".join(lines))
+    hover_text.append(consensus_hover)
+
+    colorscale = [
+        [0.0, "#FFFFFF"],
+        [0.15, "#F2E6FF"],
+        [0.35, "#D4A8FF"],
+        [0.55, "#B366FF"],
+        [0.75, "#8B2FC9"],
+        [1.0, "#4A0E6B"],
+    ]
+
+    fig = go.Figure()
+
+    fig.add_trace(
+        go.Heatmap(
+            z=z_data,
+            x=positions,
+            y=y_labels,
+            colorscale=colorscale,
+            zmin=0,
+            zmax=1,
+            hoverinfo="text",
+            text=hover_text,
+            showscale=True,
+            colorbar=dict(
+                title=dict(text="Confidence", side="right"),
+                tickmode="linear",
+                tick0=0,
+                dtick=0.2,
+                len=0.75,
+            ),
+            xgap=1,
+            ygap=2,
+        )
+    )
+
+    consensus_colors_map = []
+    for pos in range(seq_len):
+        if consensus[pos] != "?":
+            consensus_colors_map.append("#2ECC71")
+        else:
+            consensus_colors_map.append("#E67E22")
+
+    for pos in range(seq_len):
+        bg_color = consensus_colors_map[pos]
+        text_color = "white" if consensus[pos] == "?" else "#1A1A2E"
+        fig.add_annotation(
+            x=pos + 1,
+            y="Consensus",
+            text=consensus[pos],
+            showarrow=False,
+            font=dict(size=11, family="monospace", color=text_color),
+            bgcolor=bg_color,
+            bordercolor="#2C3E50",
+            borderwidth=1,
+            borderpad=2,
+        )
+
+    stats_text_lines = ["<b>Statistics</b>"]
+    for m_idx, m_name in enumerate(method_names):
+        avg_c = avg_confidences[m_idx]
+        stats_text_lines.append(f"{m_name}: avg {avg_c:.3f}")
+    stats_text_lines.append(f"Agreement: {agreement_rate:.1f}%")
+
+    fig.add_annotation(
+        xref="paper",
+        yref="paper",
+        x=1.12,
+        y=0.5,
+        text="<br>".join(stats_text_lines),
+        showarrow=False,
+        font=dict(size=11, family="sans-serif"),
+        align="left",
+        bordercolor="#BDC3C7",
+        borderwidth=1,
+        borderpad=6,
+        bgcolor="#F8F9FA",
+    )
+
+    title = "Confidence Heatmap"
+    if sequence_name:
+        title += f" - {sequence_name}"
+
+    fig.update_layout(
+        title=title,
+        xaxis_title="Residue Position",
+        yaxis_title="Method",
+        height=100 + 70 * (n_methods + 1),
+        yaxis=dict(
+            autorange="reversed",
+            tickfont=dict(size=12),
+        ),
+        xaxis=dict(
+            dtick=max(1, seq_len // 30),
+            tickfont=dict(size=10),
+        ),
+        margin=dict(r=140),
+    )
+
+    return fig, confidence_matrix, consensus, stats
+
+
 def plot_ramachandran(result: PredictionResult) -> go.Figure:
     states = result.states
 
