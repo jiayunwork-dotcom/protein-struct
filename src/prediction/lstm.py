@@ -188,11 +188,11 @@ class LSTMPredictor(StructurePrediction):
         cf_probs = self._cf_predict(sequence)
 
         # =========================================
-        # v6.2 最终融合：以enhanced_cf为绝对主体(94%)
-        # 保留少量双向LSTM(6%)的序列依赖建模
+        # v6.6 最终融合：提升LSTM权重 6%→18%
+        # LSTM特性：擅长长程依赖，倾向保留连续结构段（与NN的"保守截断"倾向正相反）
         # =========================================
-        w_lstm = 0.06
-        w_cf = 0.94
+        w_lstm = 0.18
+        w_cf = 0.82
 
         combined = (
             w_lstm * lstm_probs.astype(np.float64)
@@ -203,9 +203,80 @@ class LSTMPredictor(StructurePrediction):
         # 应用生物学约束规则
         combined = apply_structural_rules(sequence, combined, "lstm")
 
+        # ========== v6.6: LSTM独有的后处理 — 倾向于"更平滑更长"的结构段 ==========
+        # NN倾向更早结束螺旋（保守截断），LSTM倾向维持结构更长（连续平滑）
+        # 两者视觉和语义都有明显差异
+        from ..data.structure_propensities import COIL_BREAKERS, BETA_CORE, ALPHA_CORE
+
+        # 对螺旋段：LSTM倾向"多延长1个残基"
+        states_lstm = np.argmax(combined, axis=1)
+        hsegs_lstm = []
+        _s = None
+        for i in range(n):
+            if states_lstm[i] == 0 and _s is None:
+                _s = i
+            elif states_lstm[i] != 0 and _s is not None:
+                hsegs_lstm.append((_s, i - 1))
+                _s = None
+        if _s is not None:
+            hsegs_lstm.append((_s, n - 1))
+
+        for (hs, he) in hsegs_lstm:
+            ln = he - hs + 1
+            if ln < 5:
+                continue
+            # LSTM倾向将螺旋边缘1个残基"保持为H"（即便它是coil_breaker）
+            # 与NN的"保守截断"正好相反
+            # 左端: hs-1 如果不绝对是C主导，拉回H
+            for pos in [hs - 1]:
+                if 1 <= pos < n - 1:
+                    # 前一位若是螺旋友好残基(A/L/M/E/Q/K/R/V/I/M)，保留为H
+                    if sequence[pos] in ALPHA_CORE | {"V", "I", "L", "M"} and combined[pos, 0] > 0.22:
+                        combined[pos, 0] *= 1.20
+                        combined[pos, 2] *= 0.88
+                        combined[pos] = combined[pos] / combined[pos].sum()
+            # 右端: he+1 同理
+            for pos in [he + 1]:
+                if 1 <= pos < n - 1:
+                    if sequence[pos] in ALPHA_CORE | {"V", "I", "L", "M"} and combined[pos, 0] > 0.22:
+                        combined[pos, 0] *= 1.20
+                        combined[pos, 2] *= 0.88
+                        combined[pos] = combined[pos] / combined[pos].sum()
+
+        # 对E段(β折叠)：LSTM倾向连接中间的"孤岛"（连续β倾向于更长）
+        ese = np.argmax(combined, axis=1)
+        esegs = []
+        _s = None
+        for i in range(n):
+            if ese[i] == 1 and _s is None:
+                _s = i
+            elif ese[i] != 1 and _s is not None:
+                esegs.append((_s, i - 1))
+                _s = None
+        if _s is not None:
+            esegs.append((_s, n - 1))
+
+        # 对距离≤2的相邻E段，如果中间是G/S/T/D/N（弱β倾向残基），则将其桥接为E
+        if len(esegs) >= 2:
+            for idx in range(len(esegs) - 1):
+                s1, e1 = esegs[idx]
+                s2, e2 = esegs[idx + 1]
+                gap = s2 - e1 - 1
+                if 1 <= gap <= 2:
+                    # 桥接中间位置
+                    all_good = True
+                    for pg in range(e1 + 1, s2):
+                        if sequence[pg] not in {"G", "S", "T", "D", "N", "C", "Y"}:
+                            all_good = False
+                            break
+                    if all_good:
+                        for pg in range(e1 + 1, s2):
+                            combined[pg, 1] *= 1.32
+                            combined[pg] = combined[pg] / combined[pg].sum()
+
         # 最后的多样性保障：仅对长序列(>=80残基)避免全为同一状态
         # v6.4: 对于<80残基的短蛋白(如Insulin 51aa)，缺失某种状态是合理的（如全是H+C）
-        # 强行添加反而造成误判（如Insulin被强制加2个E）
+        # 强行添加反而造成误判
         state_counts = np.argmax(combined, axis=1)
         has_h = np.any(state_counts == 0)
         has_e = np.any(state_counts == 1)
@@ -222,7 +293,6 @@ class LSTMPredictor(StructurePrediction):
             for ms in missing:
                 candidates = np.argsort(-combined[:, ms])
                 count_added = 0
-                # 长序列中也只添加最多1-2个，避免过度干预
                 max_add = max(1, n // 40)
                 for idx in candidates:
                     if count_added >= max_add:

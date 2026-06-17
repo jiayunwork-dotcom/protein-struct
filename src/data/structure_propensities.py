@@ -784,6 +784,97 @@ def enhanced_chou_fasman_predict(sequence: str) -> np.ndarray:
 
     # H段 (5+) - 所有蛋白类型都boost螺旋（螺旋是最常见的二级结构）
     probs = _boost_segments(probs, 0, 5, 1.30, 1.10)
+
+    # ====== v6.6 Step A: 螺旋边界"削尖"（解决Myoglobin边界卷曲→螺旋误判问题3） ======
+    # H段boost后，段边界1-2残基如果是高Pc残基(G/P/S/D/N)，应该转回C
+    states0 = np.argmax(probs, axis=1)
+    hsegs = []
+    _start = None
+    for i in range(n):
+        if states0[i] == 0 and _start is None:
+            _start = i
+        elif states0[i] != 0 and _start is not None:
+            hsegs.append((_start, i - 1))
+            _start = None
+    if _start is not None:
+        hsegs.append((_start, n - 1))
+
+    for (hs, he) in hsegs:
+        seg_len = he - hs + 1
+        if seg_len < 5:
+            continue
+        # v6.6 修正：段内前3个残基 + 段内后3个残基 + 段外前后1个，共覆盖边界区域
+        boundary_positions = set()
+        # 段内前3 (hs, hs+1, hs+2)
+        for d in range(min(3, seg_len)):
+            boundary_positions.add(hs + d)
+        # 段内后3 (he-2, he-1, he)
+        for d in range(min(3, seg_len)):
+            boundary_positions.add(he - d)
+        # 段外±1
+        boundary_positions.add(hs - 1)
+        boundary_positions.add(he + 1)
+
+        # v6.6 +: 段内部连续2+个COIL_BREAKER → 直接转C（loop打断螺旋）
+        # 再+: 长段(≥10)中孤立的COIL_BREAKER如果H<0.9也转C（Myoglobin pos15=D场景）
+        if seg_len >= 8:
+            for ip in range(hs + 2, he - 1):
+                if sequence[ip] in COIL_BREAKERS:
+                    neighbors_breaker = 0
+                    if ip-1 >= 0 and sequence[ip-1] in COIL_BREAKERS:
+                        neighbors_breaker += 1
+                    if ip+1 < n and sequence[ip+1] in COIL_BREAKERS:
+                        neighbors_breaker += 1
+                    # 连续2+breaker OR 长段中单独breaker也处理
+                    if neighbors_breaker >= 1 or (seg_len >= 10 and probs[ip, 0] < 0.90):
+                        for dp in [-1, 0, 1]:
+                            pp = ip + dp
+                            if hs <= pp <= he and sequence[pp] in COIL_BREAKERS and probs[pp, 0] < 0.95:
+                                boundary_positions.add(pp)
+                        # 对孤立breaker自己，无论邻居是否breaker都拉C
+                        if seg_len >= 10:
+                            boundary_positions.add(ip)
+
+        for edge_pos in boundary_positions:
+            if 0 <= edge_pos < n:
+                aa = sequence[edge_pos]
+                if aa in COIL_BREAKERS:
+                    # 高Pc残基(G/P/S/D/N)在H段边界 → 强制削弱H, 增强C
+                    ph = probs[edge_pos, 0]
+                    # 降低门槛：只要不是极端主导(0.92以下)都削尖（原来0.82太低）
+                    if ph < 0.92:
+                        probs[edge_pos, 0] *= 0.70
+                        probs[edge_pos, 2] *= 1.28
+                        probs[edge_pos] = probs[edge_pos] / probs[edge_pos].sum()
+
+    # ====== v6.6 Step B: N/C端边缘β信号增强（解决Ig前20/后10残基β漏检问题1） ======
+    # beta蛋白的N/C端最常出问题：窗口信息不完整，V/I/L/Q被误判成H
+    # 策略：beta类型蛋白，边缘±8残基窗口内，若Pβ>1.05 + 相邻有足够turns → 增强E削弱H
+    edge_zone = min(8, n // 6)
+    if prot_type == "beta" and edge_zone >= 3:
+        for i in range(n):
+            is_n_edge = (i < edge_zone)
+            is_c_edge = (i >= n - edge_zone)
+            if not (is_n_edge or is_c_edge):
+                continue
+            aa = sequence[i]
+            if aa in CHOU_FASMAN:
+                ppa, ppb, ppc = CHOU_FASMAN[aa]
+                # 高β倾向性残基(V/I/L/F/Y/W/T/Q/M)
+                if ppb >= 1.05:
+                    # 周围5残基有turns(G/P/S/D/N) → 更有可能是β链而不是螺旋
+                    s3 = max(0, i - 3)
+                    e3 = min(n, i + 4)
+                    turns3 = sum(1 for a in sequence[s3:e3] if a in {"G", "P", "S", "D", "N"})
+                    beta3 = sum(1 for a in sequence[s3:e3] if a in BETA_CORE)
+                    if turns3 >= 1 or beta3 >= 2:
+                        # 削弱H, 增强E
+                        cur_h = probs[i, 0]
+                        if cur_h > 0.28:
+                            probs[i, 0] *= 0.58
+                            probs[i, 1] *= 1.30
+                            probs[i] = probs[i] / probs[i].sum()
+
     # E段 boost - 根据蛋白类型区分
     #   beta类型: boost 3+ 连续段 (beta折叠最自由)
     #   mixed类型: boost 5+ 连续段 (允许真正的长β链，但过滤短假阳性)
