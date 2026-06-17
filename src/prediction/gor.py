@@ -54,9 +54,9 @@ class GOR4Predictor(StructurePrediction):
         # ========== GOR-IV 核心算法：信息论 ==========
         gor_probs = np.zeros((n, 3), dtype=np.float64)
 
-        # 先验强度0.70（弱化原1.0但保留足够的H偏好以检测螺旋）
-        # 同时apply_structural_rules的15%全局偏置会根据序列组成动态调整
-        prior_strength = 0.70
+        # 进一步弱化先验：CF已包含先验、beta修正、连续段检测的完整逻辑
+        # GOR主要贡献位置上下文的细微信息，不应带来自己的强偏差
+        prior_strength = 0.40
         weakened_prior = prior_strength * self._prior_log
 
         for i in range(n):
@@ -90,12 +90,9 @@ class GOR4Predictor(StructurePrediction):
         cf_probs = enhanced_chou_fasman_predict(sequence)
 
         # ========== 融合：GOR + CF 加权平均 ==========
-        # 平衡设置：GOR(70%)提供窗口位置上下文，CF(30%)提供生物倾向性+beta-over-alpha修正
-        # 加上apply_structural_rules的15%全局偏置，总效果是：
-        #   约59.5% GOR窗口, 25.5% CF倾向性, 15%全局序列组成偏置
-        # 这个组合能在螺旋丰富（Myoglobin）、混合（Ubiquitin/Insulin）、折叠丰富（Ig）蛋白间取得平衡
-        alpha = 0.70  # GOR窗口LLR权重
-        beta = 0.30   # Chou-Fasman权重
+        # v6.2: CF已经很强（上下文感知+蛋白类型检测），GOR仅提供平滑
+        alpha = 0.28  # GOR窗口LLR权重（降低）
+        beta = 0.72   # Chou-Fasman权重（v6.2，核心主体）
         combined = alpha * gor_probs + beta * cf_probs
         combined = combined / combined.sum(axis=1, keepdims=True)
 

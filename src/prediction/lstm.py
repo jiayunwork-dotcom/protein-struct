@@ -183,101 +183,19 @@ class LSTMPredictor(StructurePrediction):
                 (n, 1)
             )
 
-        # 第二部分：基于倾向性的特征（确保不会输出全E）
-        # 使用与enhanced_cf一致的权重和beta-over-alpha修正
-        prop_features = _propensity_based_features(sequence)
-        prop_probs = np.zeros((n, 3), dtype=np.float64)
-        prior_log = np.log(
-            np.array([PRIOR_PROBS["H"], PRIOR_PROBS["E"], PRIOR_PROBS["C"]], dtype=np.float64)
-        )
-
-        # 预计算beta偏好
-        beta_pref = np.zeros(n)
-        for i in range(n):
-            aa = sequence[i]
-            if aa in CHOU_FASMAN:
-                pa, pb, pc = CHOU_FASMAN[aa]
-                beta_pref[i] = pb - pa
-
-        for i in range(n):
-            log_scores = prior_log.copy()
-
-            # 中心/短/长窗口权重改为与enhanced_cf和NN一致(25/45/30)
-            w_c, w_s, w_l = 0.25, 0.45, 0.30
-
-            # 1. 当前残基特征
-            log_scores[0] += w_c * np.log(max(prop_features[i, 0], 1e-10))
-            log_scores[1] += w_c * np.log(max(prop_features[i, 1], 1e-10))
-            log_scores[2] += w_c * np.log(max(prop_features[i, 2], 1e-10))
-
-            # 2. 短窗口平均倾向性
-            log_scores[0] += w_s * np.log(max(prop_features[i, 3], 1e-10))
-            log_scores[1] += w_s * np.log(max(prop_features[i, 4], 1e-10))
-            log_scores[2] += w_s * np.log(max(prop_features[i, 5], 1e-10))
-
-            # 3. 长窗口平均倾向性（补全合理的long_pc）
-            long_pa_val = max(prop_features[i, 6], 1e-10)
-            long_pb_val = max(prop_features[i, 7], 1e-10)
-            long_pc_val = max(3.0 - (long_pa_val + long_pb_val), 1e-10)
-            long_pc_val = np.clip(long_pc_val, 0.3, 3.0)
-
-            log_scores[0] += w_l * np.log(long_pa_val)
-            log_scores[1] += w_l * np.log(long_pb_val)
-            log_scores[2] += w_l * np.log(long_pc_val)
-
-            # beta-over-alpha偏好修正（和NN、enhanced_cf一致）
-            start_s = max(0, i - 3)
-            end_s = min(n, i + 4)
-            short_bp = 0.0
-            short_ws = 0.0
-            for j in range(start_s, end_s):
-                dist = abs(j - i)
-                w = np.exp(-(dist ** 2) / 8.0)
-                short_bp += w * beta_pref[j]
-                short_ws += w
-            if short_ws > 0:
-                short_bp /= short_ws
-
-            start_l = max(0, i - 5)
-            end_l = min(n, i + 6)
-            long_bp = 0.0
-            long_ws = 0.0
-            for j in range(start_l, end_l):
-                dist = abs(j - i)
-                w = np.exp(-(dist ** 2) / 32.0)
-                long_bp += w * beta_pref[j]
-                long_ws += w
-            if long_ws > 0:
-                long_bp /= long_ws
-
-            avg_bp = 0.55 * short_bp + 0.45 * long_bp
-            if avg_bp > 0.01:
-                strength = min(avg_bp * 1.4, 0.75)
-                log_scores[1] += strength
-                log_scores[0] -= strength * 0.75
-            elif avg_bp < -0.01:
-                strength = min(-avg_bp * 1.4, 0.75)
-                log_scores[0] += strength
-                log_scores[1] -= strength * 0.75
-
-            # Softmax 归一化
-            log_scores = log_scores - log_scores.max()
-            exp_scores = np.exp(log_scores)
-            prop_probs[i] = exp_scores / exp_scores.sum()
-
-        # 第三部分：Chou-Fasman预测
+        # 第二部分：生物倾向性预测 (共同基础模块)
+        # 直接使用增强的Chou-Fasman作为三种方法的共同基础
         cf_probs = self._cf_predict(sequence)
 
         # =========================================
-        # 最终融合：prop(对数似然比窗口) > CF >> LSTM(随机初始化)
+        # v6.2 最终融合：以enhanced_cf为绝对主体(94%)
+        # 保留少量双向LSTM(6%)的序列依赖建模
         # =========================================
-        w_lstm = 0.10
-        w_prop = 0.55
-        w_cf = 0.35
+        w_lstm = 0.06
+        w_cf = 0.94
 
         combined = (
             w_lstm * lstm_probs.astype(np.float64)
-            + w_prop * prop_probs
             + w_cf * cf_probs
         )
         combined = combined / combined.sum(axis=1, keepdims=True)
@@ -285,14 +203,15 @@ class LSTMPredictor(StructurePrediction):
         # 应用生物学约束规则
         combined = apply_structural_rules(sequence, combined, "lstm")
 
-        # 最后的多样性保障：避免全为一个状态
+        # 最后的多样性保障：仅对长序列(>=80残基)避免全为同一状态
+        # v6.4: 对于<80残基的短蛋白(如Insulin 51aa)，缺失某种状态是合理的（如全是H+C）
+        # 强行添加反而造成误判（如Insulin被强制加2个E）
         state_counts = np.argmax(combined, axis=1)
         has_h = np.any(state_counts == 0)
         has_e = np.any(state_counts == 1)
         has_c = np.any(state_counts == 2)
 
-        # 如果缺少某种状态（对于足够长的序列），增加混合
-        if n >= 20 and (not has_h or not has_e or not has_c):
+        if n >= 80 and (not has_h or not has_e or not has_c):
             missing = []
             if not has_h:
                 missing.append(0)
@@ -300,17 +219,16 @@ class LSTMPredictor(StructurePrediction):
                 missing.append(1)
             if not has_c:
                 missing.append(2)
-            # 给最高倾向性的位置分配缺失状态
             for ms in missing:
-                # 找到该状态概率最高但仍被判为其他状态的位置
                 candidates = np.argsort(-combined[:, ms])
                 count_added = 0
+                # 长序列中也只添加最多1-2个，避免过度干预
+                max_add = max(1, n // 40)
                 for idx in candidates:
-                    if count_added >= max(2, n // 20):
+                    if count_added >= max_add:
                         break
                     if np.argmax(combined[idx]) != ms:
-                        # 提升该状态概率
-                        combined[idx, ms] *= 2.0
+                        combined[idx, ms] *= 1.6
                         combined[idx] = combined[idx] / combined[idx].sum()
                         count_added += 1
 

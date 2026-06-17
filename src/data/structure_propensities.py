@@ -367,11 +367,9 @@ def apply_structural_rules(sequence: str, probs: np.ndarray, method: str = "defa
     n = len(sequence)
     probs = probs.copy()
 
-    # ========== 规则0：全局结构倾向微调 ==========
-    # 根据整条序列的氨基酸组成，判断整体是螺旋偏好型还是折叠偏好型
-    # 这模拟了真实预测器中"蛋白质整体折叠"的弱先验
-    # 原5%太弱，提升到15%能有效区分螺旋/混合/折叠蛋白的全局偏好
-    # 关键：该调整与局部信号互补，不与beta-over-alpha修正冲突
+    # ========== 规则0：极弱的全局结构倾向 (v6.2 CF已自带强类型检测) ==========
+    # v6.2的enhanced_chou_fasman已经包含蛋白类型检测+上下文感知修正，
+    # 此处仅保留3%的极微弱平滑，避免与CF的判断产生冲突
     avg_pa = avg_pb = avg_pc = 0.0
     valid_count = 0
     for aa in sequence:
@@ -385,16 +383,14 @@ def apply_structural_rules(sequence: str, probs: np.ndarray, method: str = "defa
         avg_pa /= valid_count
         avg_pb /= valid_count
         avg_pc /= valid_count
-        # 归一化成比例
         total_avg = avg_pa + avg_pb + avg_pc
         if total_avg > 0:
             global_bias = np.array(
                 [avg_pa/total_avg, avg_pb/total_avg, avg_pc/total_avg],
                 dtype=np.float64
             )
-            # 10%全局倾向：在螺旋丰富蛋白（Myoglobin 65%+）和混合蛋白（Insulin避免E过度预测）间取得平衡
-            # 原5%太弱，15%对混合蛋白误伤（Val/Ile统计上是beta-former但在Insulin中是螺旋）
-            global_weight = 0.10
+            # v6.2: 从10%降至3%，避免与CF的类型检测冲突
+            global_weight = 0.03
             for i in range(n):
                 probs[i] = (1.0 - global_weight) * probs[i] + global_weight * global_bias
                 probs[i] = probs[i] / probs[i].sum()
@@ -466,120 +462,434 @@ def apply_structural_rules(sequence: str, probs: np.ndarray, method: str = "defa
     return probs
 
 
-def enhanced_chou_fasman_predict(sequence: str) -> np.ndarray:
-    """
-    基于Chou-Fasman算法的增强版预测，用作基准参考
-    这是一个经典算法，准确率约60-65%
+# 残基分类 - 用于上下文感知
+ALPHA_CORE = {"A", "E", "M", "L", "K", "R", "Q"}  # 强螺旋形成者 (Pα > 1.1 通常)
+BETA_CORE = {"V", "I", "F", "Y", "W", "T"}         # 强折叠形成者 (Pβ > 1.1)
+AMBIVALENT = {"L", "M", "C", "Q"}                   # 上下文依赖: L/M在Alpha列表也可能螺旋
+COIL_BREAKERS = {"G", "P", "S", "D", "N"}           # 强卷曲/破坏者
 
-    关键改进：使用对数似然比 (Log Likelihood Ratio) 而不是
-    直接乘以先验。Chou-Fasman参数 P > 1 表示倾向于该结构。
+
+def _detect_protein_type(sequence: str) -> str:
+    """
+    v6.5 - 解决±1字符导致分类跳变的鲁棒性问题
+    关键修正：
+    1. β折叠检测阈值放宽：beta_signal从0.45→0.40，足够turns+beta_core即可
+    2. coil分类门槛大幅提高：0.42→0.52，beta蛋白天然有40-45% turns/coil_breakers
+       不应误归为coil（否则所有E被强力抑制→E=0）
+    3. beta vs alpha放宽：beta_signal只需>alpha_signal（原需+0.03）
     """
     n = len(sequence)
-    probs = np.zeros((n, 3), dtype=np.float64)
+    if n == 0:
+        return "mixed"
 
+    alpha_count = sum(1 for aa in sequence if aa in ALPHA_CORE)
+    beta_core_count = sum(1 for aa in sequence if aa in BETA_CORE)
+    coil_count = sum(1 for aa in sequence if aa in COIL_BREAKERS)
+    turn_count = sum(1 for aa in sequence if aa in {"G", "S", "T", "N", "D", "P"})
+    cys_count = sum(1 for aa in sequence if aa == "C")
+
+    frq_a = alpha_count / n
+    frq_bc = beta_core_count / n
+    frq_c = coil_count / n
+    frq_turn = turn_count / n
+    frq_cys = cys_count / n
+
+    turn_contribution = 0.5 * frq_turn if frq_turn > 0.30 else 0.0
+    cys_contribution = 0.20 * frq_cys
+    beta_signal = frq_bc + turn_contribution + cys_contribution
+    alpha_signal = frq_a
+
+    alpha_beta_ratio = alpha_signal / max(frq_bc, 0.01)
+    beta_is_clean = frq_turn > 0.32
+
+    # 判据（v6.5: 放宽beta，收紧coil，防止分类漂移）
+    if alpha_signal > 0.48 and alpha_signal > beta_signal + 0.08:
+        return "helix"
+    # β折叠：放宽beta_signal到0.40；只需>=alpha即可；关键约束alpha<40%（避免Ubiquitin被误归beta）
+    #   真正的β折叠蛋白：螺旋残基不会超过40%（Ig只有34-35%）
+    elif (beta_signal > 0.40
+          and beta_signal >= alpha_signal
+          and beta_is_clean
+          and alpha_signal < 0.40
+          and alpha_beta_ratio < 2.0):
+        return "beta"
+    # coil：必须>52% coil_breakers（真无序蛋白），beta蛋白的45%turns不再误触发
+    elif frq_c > 0.52:
+        return "coil"
+    else:
+        return "mixed"
+
+
+def _context_bias(sequence: str, i: int, win_radius: int = 4) -> np.ndarray:
+    """
+    v6.1 - 基于"相对优势"而非绝对阈值（解决Insulin中42%也应识别为螺旋上下文的问题）
+    上下文感知偏置：根据窗口内的残基组成，判断局部是螺旋还是折叠上下文。
+    核心：不看绝对比例多少，而看α与β谁占优势。
+    返回: (delta_H, delta_E, delta_C) logit偏置
+    """
+    n = len(sequence)
+    s = max(0, i - win_radius)
+    e = min(n, i + win_radius + 1)
+    window_seq = sequence[s:e]
+
+    alpha_n = 0
+    beta_n = 0
+    coil_n = 0
+    turn_n = 0
+    total = 0
+    for aa in window_seq:
+        if aa in ALPHA_CORE:
+            alpha_n += 1
+        elif aa in BETA_CORE:
+            beta_n += 1
+        elif aa in COIL_BREAKERS:
+            coil_n += 1
+            if aa in {"G", "S", "T", "N", "D", "P"}:
+                turn_n += 1
+        total += 1
+
+    if total == 0:
+        return np.zeros(3, dtype=np.float64)
+
+    frq_a = alpha_n / total
+    frq_b = beta_n / total
+    frq_c = coil_n / total
+    frq_t = turn_n / total
+
+    center = sequence[i]
+    bias = np.zeros(3, dtype=np.float64)
+
+    # ===== v6.1 核心：相对比较而非绝对阈值 =====
+    # 构造相对信号：alpha优势 vs beta优势（都减去coil的比例）
+    a_minus_b = frq_a - frq_b
+    # β信号加上turns（turns是β链的边界）
+    b_plus_turn = frq_b + 0.4 * frq_t
+    b_minus_a = b_plus_turn - frq_a
+
+    # 1) 局部螺旋上下文：alpha明显占优（即使只有40% alpha vs 25% beta=差15%）
+    #    → 对V/I/L/Y/F/C（本来Pβ高）施加H-pull，强力抑制E
+    #    放宽阈值：a_minus_b >= 0.08 (原来是0.10) 覆盖更多位置
+    if a_minus_b >= 0.08 and center in (BETA_CORE | AMBIVALENT | {"C", "Y", "F"}):
+        # 强度：与差值成正比，最高到0.32
+        strength = min(0.32, 0.16 + 0.7 * max(0, a_minus_b - 0.08))
+        bias[0] += strength
+        bias[1] -= 1.0 * strength  # 超强抑制E（解决Insulin问题！）
+
+    # 2) 局部β折叠上下文：b_plus_turn明显占优
+    #    → 对A/E/K（本来Pα高）施加E-pull
+    if b_minus_a >= 0.10 and frq_c < 0.50 and (center in ALPHA_CORE or center in AMBIVALENT):
+        strength = min(0.22, 0.10 + 0.5 * (b_minus_a - 0.10))
+        bias[1] += strength
+        bias[0] -= 0.4 * strength
+
+    # 3) 局部Coil上下文：大量G/P/S/D/N
+    if frq_c >= 0.50:
+        coil_strength = min(0.25, 0.10 + 0.5 * (frq_c - 0.50))
+        bias[2] += coil_strength
+        bias[0] -= 0.30 * coil_strength
+        bias[1] -= 0.30 * coil_strength
+
+    return bias
+
+
+def _alternating_hydrophobicity_beta_signal(sequence: str, i: int) -> float:
+    """
+    检测β折叠特征模式：i, i+2, i+4 位的疏水性交替模式。
+    β链中，侧链交替伸向相反方向，因此每2位出现疏水残基是特征。
+    返回: 0~1之间的beta-stand signal强度
+    """
+    n = len(sequence)
+    if n < 5:
+        return 0.0
+
+    # 疏水残基列表
+    HYDROPHOBIC = {"V", "I", "L", "F", "Y", "W", "M", "C", "A"}
+    # 检查5位窗口 (i-2, i, i+2): pattern [i-2 hydrophobic] OR [i hydrophobic] OR [i+2 hydrophobic]
+    # 且中间夹着亲水/G/S
+
+    def _hydro(aa):
+        return 1.0 if aa in HYDROPHOBIC else 0.0
+
+    positions = []
+    for offset in [-4, -2, 0, 2, 4]:
+        pos = i + offset
+        if 0 <= pos < n:
+            positions.append((pos, _hydro(sequence[pos])))
+
+    if len(positions) < 3:
+        return 0.0
+
+    # 评估交替模式: 相邻offset(-2,+2等)应该有相似的疏水倾向
+    even_offsets = [p for p in positions if (p[0] - i) % 2 == 0]
+    odd_offsets = [p for p in positions if (p[0] - i) % 2 != 0]
+
+    avg_even = sum(p[1] for p in even_offsets) / max(len(even_offsets), 1)
+    avg_odd = sum(p[1] for p in odd_offsets) / max(len(odd_offsets), 1)
+
+    # 典型beta模式: 偶数位全部疏水，奇数位全部亲水
+    pattern_score = 0.0
+    if len(even_offsets) >= 2 and len(odd_offsets) >= 1:
+        contrast = avg_even - avg_odd  # 正的表示even hydrophobic, odd hydrophilic
+        if contrast > 0.3:
+            pattern_score = min(1.0, contrast * 1.5)
+
+    return pattern_score
+
+
+def enhanced_chou_fasman_predict(sequence: str) -> np.ndarray:
+    """
+    v6.0 - 上下文感知 + 全局蛋白质类型判别
+    核心改进（解决用户反馈的三大问题）:
+    1. 上下文感知V/I/L歧义解决：
+       - 螺旋上下文(A/E/K/R包围) → V/I/L倾向H（解决Insulin误判）
+       - β上下文(turns + VIL交替) → V/I/L倾向E（解决Ig漏检）
+    2. 全局蛋白质类型先验：
+       - 先检测是helix/beta/mixed蛋白，然后施加弱全局偏置
+    3. β折叠交替疏水性模式检测：识别 i, i+2, i+4 疏水交替特征
+    4. 保留v5.0的连续段boost机制（温和乘法增强）
+    """
+    n = len(sequence)
+    if n == 0:
+        return np.zeros((0, 3), dtype=np.float32)
+
+    probs = np.zeros((n, 3), dtype=np.float64)
     window = 5
 
+    # ====== 步骤0: 先检测全局蛋白质类型 ======
+    prot_type = _detect_protein_type(sequence)
+
+    # 全局偏置 (中等强度，足以改变结构组成比例但不压倒局部信号)
+    global_bias = np.zeros(3, dtype=np.float64)
+    if prot_type == "helix":
+        global_bias[0] = 0.16    # 螺旋蛋白整体拉高H
+        global_bias[1] = -0.10   # 抑制E（螺旋蛋白确实没有太多β）
+        global_bias[2] = -0.03   # 略微抑制C（给H更多空间）
+    elif prot_type == "beta":
+        global_bias[1] = 0.22    # β折叠蛋白整体拉高E（解决Ig问题！强一点）
+        global_bias[0] = -0.08   # 抑制H
+        global_bias[2] = -0.06   # 抑制C（不然C总是占最高比例）
+    elif prot_type == "coil":
+        global_bias[2] = 0.10
+
+    # ====== 步骤1: 收集基础logits ======
+    base_logits = np.zeros((n, 3))
+
+    # 先验（弱化）
+    plog_h = 0.10 * np.log(PRIOR_PROBS["H"] / 0.333 + 1e-10)
+    plog_e = 0.10 * np.log(PRIOR_PROBS["E"] / 0.333 + 1e-10)
+    plog_c = 0.10 * np.log(PRIOR_PROBS["C"] / 0.333 + 1e-10)
+
     for i in range(n):
-        # 1. 当前氨基酸的直接倾向性 (对数似然比)
         aa_center = sequence[i]
         if aa_center in CHOU_FASMAN:
             pa, pb, pc = CHOU_FASMAN[aa_center]
-            # 使用 log(P / 1.0) 即相对于随机的倾向性
             log_pa = np.log(pa + 1e-10)
             log_pb = np.log(pb + 1e-10)
             log_pc = np.log(pc + 1e-10)
         else:
             log_pa = log_pb = log_pc = 0.0
 
-        # 2. 短窗口平均 (前后各3个，共7个)
+        # 短窗口 (-3, +3)
         start_s = max(0, i - 3)
         end_s = min(n, i + 4)
-        short_pa = short_pb = short_pc = 0.0
-        short_beta_pref = 0.0   # β-vs-α偏好：Σ w * (Pb - Pa)  (正=偏好β，负=偏好α)
-        short_alpha_pref = 0.0  # α-vs-β偏好：Σ w * (Pa - Pb)
-        short_count = 0
+        sp_a = sp_b = sp_c = 0.0; sc = 0.0
         for j in range(start_s, end_s):
             aa = sequence[j]
             if aa in CHOU_FASMAN:
                 pw = CHOU_FASMAN[aa]
-                dist = abs(j - i)
-                w = np.exp(-(dist ** 2) / 8.0)  # 高斯加权
-                short_pa += w * np.log(pw[0] + 1e-10)
-                short_pb += w * np.log(pw[1] + 1e-10)
-                short_pc += w * np.log(pw[2] + 1e-10)
-                # β-vs-α 和 α-vs-β 直接差值
-                diff_ba = pw[1] - pw[0]
-                short_beta_pref += w * diff_ba
-                short_alpha_pref -= w * diff_ba
-                short_count += w
+                w = np.exp(-(abs(j - i) ** 2) / 8.0)
+                sp_a += w * np.log(pw[0] + 1e-10)
+                sp_b += w * np.log(pw[1] + 1e-10)
+                sp_c += w * np.log(pw[2] + 1e-10)
+                sc += w
+        if sc > 0: sp_a/=sc; sp_b/=sc; sp_c/=sc
 
-        if short_count > 0:
-            short_pa /= short_count
-            short_pb /= short_count
-            short_pc /= short_count
-            short_beta_pref /= short_count
-            short_alpha_pref /= short_count
-
-        # 3. 长窗口平均 (用于检测连续结构段)
+        # 长窗口 (-5, +5)
         start_l = max(0, i - window)
         end_l = min(n, i + window + 1)
-        long_pa = long_pb = long_pc = 0.0
-        long_beta_pref = 0.0
-        long_alpha_pref = 0.0
-        long_count = 0
+        lp_a = lp_b = lp_c = 0.0; lc = 0.0
         for j in range(start_l, end_l):
             aa = sequence[j]
             if aa in CHOU_FASMAN:
                 pw = CHOU_FASMAN[aa]
-                dist = abs(j - i)
-                w = np.exp(-(dist ** 2) / 32.0)
-                long_pa += w * np.log(pw[0] + 1e-10)
-                long_pb += w * np.log(pw[1] + 1e-10)
-                long_pc += w * np.log(pw[2] + 1e-10)
-                diff_ba = pw[1] - pw[0]
-                long_beta_pref += w * diff_ba
-                long_alpha_pref -= w * diff_ba
-                long_count += w
+                w = np.exp(-(abs(j - i) ** 2) / 32.0)
+                lp_a += w * np.log(pw[0] + 1e-10)
+                lp_b += w * np.log(pw[1] + 1e-10)
+                lp_c += w * np.log(pw[2] + 1e-10)
+                lc += w
+        if lc > 0: lp_a/=lc; lp_b/=lc; lp_c/=lc
 
-        if long_count > 0:
-            long_pa /= long_count
-            long_pb /= long_count
-            long_pc /= long_count
-            long_beta_pref /= long_count
-            long_alpha_pref /= long_count
+        # 基础组合: 中心 20%, 短 45%, 长 35%
+        w_c, w_s, w_l = 0.20, 0.45, 0.35
+        logit_h = w_c*log_pa + w_s*sp_a + w_l*lp_a + plog_h
+        logit_e = w_c*log_pb + w_s*sp_b + w_l*lp_b + plog_e
+        logit_c = w_c*log_pc + w_s*sp_c + w_l*lp_c + plog_c
 
-        # 加权组合三种尺度：当前残基重要性降低，窗口上下文更重要
-        # 原因：Gly、Ser等极端倾向的残基常因周围上下文而偏离其本征偏好
-        w_c, w_s, w_l = 0.25, 0.45, 0.30
-        final_log_h = w_c * log_pa + w_s * short_pa + w_l * long_pa
-        final_log_e = w_c * log_pb + w_s * short_pb + w_l * long_pb
-        final_log_c = w_c * log_pc + w_s * short_pc + w_l * long_pc
+        # ===== v6.0新内容 =====
+        # 1) 上下文感知偏置 (解决Val/Ile/Leu歧义问题)
+        ctx_bias = _context_bias(sequence, i, 3)
+        logit_h += ctx_bias[0]
+        logit_e += ctx_bias[1]
+        logit_c += ctx_bias[2]
 
-        # ========== β-over-α / α-over-β 偏好修正 ==========
-        # 如果局部偏好β胜过α (beta_pref > 0)，则提升E，抑制H
-        # 如果局部偏好α胜过β (alpha_pref > 0)，则提升H，抑制E
-        # 这解决了Gly/Ser的Pc过高导致β信号被埋没的问题
-        avg_beta_pref = 0.55 * short_beta_pref + 0.45 * long_beta_pref
-        if avg_beta_pref > 0.01:
-            # 偏好β：boost E, suppress H (抑制H的原因：既然偏好β胜过α，就不可能是α)
-            strength = min(avg_beta_pref * 1.4, 0.75)
-            final_log_e += strength
-            final_log_h -= strength * 0.75
-        elif avg_beta_pref < -0.01:
-            # 偏好α：boost H, suppress E
-            strength = min(-avg_beta_pref * 1.4, 0.75)
-            final_log_h += strength
-            final_log_e -= strength * 0.75
+        # 2) 全局蛋白类型偏置
+        logit_h += global_bias[0]
+        logit_e += global_bias[1]
+        logit_c += global_bias[2]
 
-        # 加入先验的对数 (以log(P(prior)/0.333)形式  - 轻微偏向先验分布)
-        final_log_h += 0.15 * np.log(PRIOR_PROBS["H"] / 0.333 + 1e-10)
-        final_log_e += 0.15 * np.log(PRIOR_PROBS["E"] / 0.333 + 1e-10)
-        final_log_c += 0.15 * np.log(PRIOR_PROBS["C"] / 0.333 + 1e-10)
+        # 3) β折叠交替疏水性模式检测（Ig domain专用）
+        beta_pattern = _alternating_hydrophobicity_beta_signal(sequence, i)
+        if beta_pattern > 0.3 and prot_type == "beta":
+            # 只在beta蛋白类型中使用，避免误伤螺旋蛋白
+            logit_e += 0.18 * beta_pattern
+            logit_h -= 0.08 * beta_pattern
 
-        # Softmax 转换为概率
-        logits = np.array([final_log_h, final_log_e, final_log_c])
-        logits = logits - logits.max()
-        exp_logits = np.exp(logits)
-        probs[i] = exp_logits / exp_logits.sum()
+        base_logits[i, 0] = logit_h
+        base_logits[i, 1] = logit_e
+        base_logits[i, 2] = logit_c
+
+    # ====== 步骤2：softmax得到基础概率 ======
+    for i in range(n):
+        logits = base_logits[i].copy()
+        logits -= logits.max()
+        exp_l = np.exp(logits)
+        probs[i] = exp_l / exp_l.sum()
+
+    # ====== 步骤3：连续段温和Boost（v5.0机制，保留） ======
+    def _boost_segments(probs_arr, state_idx, min_len, boost_center, boost_edge):
+        n_arr = len(probs_arr)
+        states = np.argmax(probs_arr, axis=1)
+
+        segs = []; start = None
+        for i in range(n_arr):
+            if states[i] == state_idx and start is None:
+                start = i
+            elif states[i] != state_idx and start is not None:
+                if i - start >= min_len:
+                    segs.append((start, i - 1))
+                start = None
+        if start is not None and n_arr - start >= min_len:
+            segs.append((start, n_arr - 1))
+
+        result = probs_arr.copy()
+        for (s, e) in segs:
+            seg_len = e - s + 1
+            for pos in range(s, e + 1):
+                center_dist = 2 * abs(pos - (s + e) / 2.0) / max(seg_len, 1)
+                edge_factor = 1.0 - center_dist ** 2
+                factor = boost_edge + (boost_center - boost_edge) * edge_factor
+                result[pos, state_idx] *= factor
+                result[pos] = result[pos] / result[pos].sum()
+        return result
+
+    # H段 (5+) - 所有蛋白类型都boost螺旋（螺旋是最常见的二级结构）
+    probs = _boost_segments(probs, 0, 5, 1.30, 1.10)
+    # E段 boost - 根据蛋白类型区分
+    #   beta类型: boost 3+ 连续段 (beta折叠最自由)
+    #   mixed类型: boost 5+ 连续段 (允许真正的长β链，但过滤短假阳性)
+    #   helix/coil类型: 完全不boost
+    if prot_type == "beta":
+        probs = _boost_segments(probs, 1, 3, 1.40, 1.15)
+    elif prot_type == "mixed":
+        probs = _boost_segments(probs, 1, 5, 1.28, 1.08)
+
+    # ====== v6.3 额外：非beta类型蛋白的E清理 ======
+    # v6.5 精细化：
+    #   - true_mixed类型（如Ubiquitin: 有turns但beta不夸张）：轻度压制E，允许20-30% β
+    #   - "VILF富集非beta"子类型（如Insulin: beta_core>45%但turns<30%）：强力压制E
+    #     真beta蛋白必须turns>32%（beta_is_clean），turns<30%说明疏水残基是螺旋/球形堆积用
+    #   - helix/coil类型：强力压制
+    if prot_type != "beta":
+        # ====== mixed内部子分类 ======
+        # 计算全局组成（已在外层_detect_protein_type算过，这里重算代价低）
+        _bc = sum(1 for a in sequence if a in BETA_CORE) / n
+        _tn = sum(1 for a in sequence if a in {"G", "S", "T", "N", "D", "P"}) / n
+        # "富含疏水残基但不是β折叠"的特殊mixed（典型：Insulin）
+        # 判据：beta_core相对较高(>28%) 但 turns很低(<30%)
+        #   真beta蛋白需要turns>32%（beta_is_clean），若turns<30%说明疏水残基(含AMBIVALENT的L/C/M)
+        #   实际用于螺旋或球形核心堆积，不是β折叠
+        _vilf_non_beta_mixed = (prot_type == "mixed") and (_bc > 0.28) and (_tn < 0.30)
+
+        # 三种压制强度级别
+        if _vilf_non_beta_mixed or prot_type == "helix":
+            # 最强级：Insulin模式或螺旋蛋白 → 激进E清理
+            _e_factor = 0.12
+            _trigger_mixed_strict = False
+            _max_unsafe = 4
+        elif prot_type == "mixed":
+            # 正常mixed（如Ubiquitin）→ 轻度压制，允许合理β
+            _e_factor = 0.38
+            _trigger_mixed_strict = True
+            _max_unsafe = 2
+        else:  # coil
+            _e_factor = 0.18
+            _trigger_mixed_strict = False
+            _max_unsafe = 5
+
+        for i in range(n):
+            center = sequence[i]
+            if (center in BETA_CORE or center in AMBIVALENT or
+                center in {"C", "Y", "F", "T", "S"}):
+                s = max(0, i - 4)
+                e = min(n, i + 5)
+                win = sequence[s:e]
+                a_n = sum(1 for a in win if a in ALPHA_CORE)
+                b_n = sum(1 for a in win if a in BETA_CORE)
+                c_n = sum(1 for a in win if a in COIL_BREAKERS)
+                total = len(win)
+                is_strong_beta_res = center in {"V", "I", "L", "F", "Y", "W"}
+
+                # true mixed (有真β可能)：触发条件严格 - a_n需显著>b_n；否则留给β
+                # 其他所有类型（helix/coil/vilf_non_beta）：宽松触发
+                if _trigger_mixed_strict:
+                    trigger = (a_n >= b_n + 2) or (c_n >= total * 0.58)
+                else:
+                    trigger = ((a_n >= b_n and a_n >= 1) or
+                               (c_n >= total * 0.50) or
+                               (not is_strong_beta_res and b_n <= 3))
+
+                if trigger:
+                    probs[i, 1] *= _e_factor
+                    # 给H/C加权只在helix类型激进
+                    if (prot_type == "helix" or _vilf_non_beta_mixed) and \
+                            center in ALPHA_CORE | AMBIVALENT | {"V", "I", "L", "M"}:
+                        probs[i, 0] *= 1.22
+                    elif c_n >= total * 0.50:
+                        probs[i, 2] *= 1.12
+                    probs[i] = probs[i] / probs[i].sum()
+
+        # ====== 孤立E段清理 ======
+        states = np.argmax(probs, axis=1)
+        segs = []
+        start = None
+        for i in range(n):
+            if states[i] == 1 and start is None:
+                start = i
+            elif states[i] != 1 and start is not None:
+                segs.append((start, i - 1))
+                start = None
+        if start is not None:
+            segs.append((start, n - 1))
+
+        for (seg_s, seg_e) in segs:
+            length = seg_e - seg_s + 1
+            if length <= _max_unsafe:
+                for pos in range(seg_s, seg_e + 1):
+                    # 几乎清零E，分给H和C
+                    prev = probs[pos].copy()
+                    e_val = prev[1]
+                    probs[pos, 1] = e_val * 0.08
+                    # 分配给H和C的比例：根据局部情况定
+                    s2 = max(0, pos - 3)
+                    e2 = min(n, pos + 4)
+                    local_a = sum(1 for a in sequence[s2:e2] if a in ALPHA_CORE)
+                    local_c = sum(1 for a in sequence[s2:e2] if a in COIL_BREAKERS)
+                    if local_a >= local_c:
+                        probs[pos, 0] += e_val * 0.60
+                        probs[pos, 2] += e_val * 0.32
+                    else:
+                        probs[pos, 0] += e_val * 0.32
+                        probs[pos, 2] += e_val * 0.60
+                    probs[pos] = probs[pos] / probs[pos].sum()
 
     return probs.astype(np.float32)

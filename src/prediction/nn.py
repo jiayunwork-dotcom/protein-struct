@@ -148,85 +148,17 @@ class NNPredictor(StructurePrediction):
             logits = h2 @ self.weights["W3"] + self.weights["b3"]
             nn_probs[i] = _softmax(logits.reshape(1, -1))[0]
 
-        # ========== 分支2：倾向性特征预测 (更可靠的基础) ==========
-        # 使用与enhanced_chou_fasman相同的逻辑：降低中心残基权重，加入beta-over-alpha修正
-        prop_probs = np.zeros((n, 3), dtype=np.float64)
-
-        # 预计算每个残基的Pb-Pa差值（用于beta-over-alpha修正）
-        beta_pref = np.zeros(n)
-        for i in range(n):
-            aa = sequence[i]
-            if aa in CHOU_FASMAN:
-                pa, pb, pc = CHOU_FASMAN[aa]
-                beta_pref[i] = pb - pa
-
-        for i in range(n):
-            log_scores = self._prior_log.copy()
-            prop_feats = self._window_propensity_features(sequence, i)
-
-            # 调整为enhanced_cf相同的权重比例：中心25%，短窗口45%，长窗口30%
-            # (原来中心50%导致Gly/Ser的Pc过度主导)
-            w_c, w_s, w_l = 0.25, 0.45, 0.30
-            log_scores[0] += w_c * prop_feats[6] + w_s * prop_feats[0] + w_l * prop_feats[3]
-            log_scores[1] += w_c * prop_feats[7] + w_s * prop_feats[1] + w_l * prop_feats[4]
-            log_scores[2] += w_c * prop_feats[8] + w_s * prop_feats[2] + w_l * prop_feats[5]
-
-            # beta-over-alpha偏好修正（与enhanced_cf保持一致）
-            # 计算短窗口beta偏好
-            start_s = max(0, i - 3)
-            end_s = min(n, i + 4)
-            short_bp = 0.0
-            short_w_sum = 0.0
-            for j in range(start_s, end_s):
-                dist = abs(j - i)
-                w = np.exp(-(dist ** 2) / 8.0)
-                short_bp += w * beta_pref[j]
-                short_w_sum += w
-            if short_w_sum > 0:
-                short_bp /= short_w_sum
-
-            # 长窗口beta偏好
-            start_l = max(0, i - 5)
-            end_l = min(n, i + 6)
-            long_bp = 0.0
-            long_w_sum = 0.0
-            for j in range(start_l, end_l):
-                dist = abs(j - i)
-                w = np.exp(-(dist ** 2) / 32.0)
-                long_bp += w * beta_pref[j]
-                long_w_sum += w
-            if long_w_sum > 0:
-                long_bp /= long_w_sum
-
-            avg_bp = 0.55 * short_bp + 0.45 * long_bp
-            if avg_bp > 0.01:
-                strength = min(avg_bp * 1.4, 0.75)
-                log_scores[1] += strength
-                log_scores[0] -= strength * 0.75
-            elif avg_bp < -0.01:
-                strength = min(-avg_bp * 1.4, 0.75)
-                log_scores[0] += strength
-                log_scores[1] -= strength * 0.75
-
-            log_scores = log_scores - log_scores.max()
-            exp_scores = np.exp(log_scores)
-            prop_probs[i] = exp_scores / exp_scores.sum()
-
-        # ========== 分支3：Chou-Fasman 增强预测 ==========
+        # ========== 分支2：生物倾向性预测 (共同基础模块) ==========
+        # 直接使用增强的Chou-Fasman作为三种方法的共同基础（含完整的v3.0逻辑）
+        # 避免之前prop_probs和cf_probs重复计算却逻辑不一致的bug
         cf_probs = self._cf_predict(sequence)
 
-        # ========== 融合三个分支 ==========
-        # 倾向性特征(对数似然比窗口，基于真实文献数据)是主力
-        # CF是辅助，ML分支只做极轻的平滑
-        w_nn = 0.05
-        w_prop = 0.60
-        w_cf = 0.35
+        # ========== 融合 ==========
+        # v6.2: CF为绝对主体(96%)，保留少量神经网络(4%)的多样性
+        w_nn = 0.04
+        w_cf = 0.96
 
-        combined = (
-            w_nn * nn_probs
-            + w_prop * prop_probs
-            + w_cf * cf_probs
-        )
+        combined = w_nn * nn_probs + w_cf * cf_probs
         combined = combined / combined.sum(axis=1, keepdims=True)
 
         # ========== 应用生物学约束规则 ==========
