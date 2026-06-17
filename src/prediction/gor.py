@@ -124,6 +124,30 @@ class GOR4Predictor(StructurePrediction):
         # ========== 应用生物学约束规则 ==========
         combined = apply_structural_rules(sequence, combined, "gor4")
 
+        # ========== v6.7: GOR独有 — N/C端β信号二次增强 ==========
+        # GOR的信息论窗口在序列边缘信息不完整（前后各8残基窗口被截断），
+        # 导致N端β链系统性漏检。对beta类型蛋白的边缘区域做GOR专属增强。
+        from ..data.structure_propensities import _detect_protein_type, BETA_CORE, COIL_BREAKERS, ALPHA_CORE
+        _ptype = _detect_protein_type(sequence)
+        if _ptype == "beta":
+            _edge = min(12, n // 4)
+            for i in range(n):
+                if not (i < _edge or i >= n - _edge):
+                    continue
+                aa = sequence[i]
+                if aa in CHOU_FASMAN:
+                    _pa, _pb, _pc = CHOU_FASMAN[aa]
+                    # 条件1：β倾向残基（Pβ>=1.0）在边缘且当前H>E → 翻转
+                    if _pb >= 1.0 and combined[i, 0] > combined[i, 1]:
+                        combined[i, 1] *= 1.55
+                        combined[i, 0] *= 0.65
+                        combined[i] = combined[i] / combined[i].sum()
+                    # 条件2：非COIL_BREAKER、非强α残基（Pα<1.3）在边缘 → 也给E一定加成
+                    elif aa not in COIL_BREAKERS and _pa < 1.3 and _pb > 0.7 and combined[i, 2] > combined[i, 1]:
+                        combined[i, 1] *= 1.80
+                        combined[i, 2] *= 0.58
+                        combined[i] = combined[i] / combined[i].sum()
+
         return PredictionResult(
             sequence=sequence,
             method=self.name,

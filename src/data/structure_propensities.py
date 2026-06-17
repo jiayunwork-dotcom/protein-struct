@@ -785,8 +785,9 @@ def enhanced_chou_fasman_predict(sequence: str) -> np.ndarray:
     # H段 (5+) - 所有蛋白类型都boost螺旋（螺旋是最常见的二级结构）
     probs = _boost_segments(probs, 0, 5, 1.30, 1.10)
 
-    # ====== v6.6 Step A: 螺旋边界"削尖"（解决Myoglobin边界卷曲→螺旋误判问题3） ======
-    # H段boost后，段边界1-2残基如果是高Pc残基(G/P/S/D/N)，应该转回C
+    # ====== v6.7 Step A: 螺旋边界"削尖" + 长段内部分裂 ======
+    # 1) H段boost后，段边界的COIL_BREAKER残基转回C
+    # 2) 长H段(>=12)内部如果出现"高Pβ残基连续3+"区域，分裂为C（真实结构中的转折区域）
     states0 = np.argmax(probs, axis=1)
     hsegs = []
     _start = None
@@ -803,20 +804,16 @@ def enhanced_chou_fasman_predict(sequence: str) -> np.ndarray:
         seg_len = he - hs + 1
         if seg_len < 5:
             continue
-        # v6.6 修正：段内前3个残基 + 段内后3个残基 + 段外前后1个，共覆盖边界区域
+        # 段边界COIL_BREAKER削尖
         boundary_positions = set()
-        # 段内前3 (hs, hs+1, hs+2)
         for d in range(min(3, seg_len)):
             boundary_positions.add(hs + d)
-        # 段内后3 (he-2, he-1, he)
         for d in range(min(3, seg_len)):
             boundary_positions.add(he - d)
-        # 段外±1
         boundary_positions.add(hs - 1)
         boundary_positions.add(he + 1)
 
-        # v6.6 +: 段内部连续2+个COIL_BREAKER → 直接转C（loop打断螺旋）
-        # 再+: 长段(≥10)中孤立的COIL_BREAKER如果H<0.9也转C（Myoglobin pos15=D场景）
+        # 段内部连续COIL_BREAKER → 转C
         if seg_len >= 8:
             for ip in range(hs + 2, he - 1):
                 if sequence[ip] in COIL_BREAKERS:
@@ -825,23 +822,61 @@ def enhanced_chou_fasman_predict(sequence: str) -> np.ndarray:
                         neighbors_breaker += 1
                     if ip+1 < n and sequence[ip+1] in COIL_BREAKERS:
                         neighbors_breaker += 1
-                    # 连续2+breaker OR 长段中单独breaker也处理
                     if neighbors_breaker >= 1 or (seg_len >= 10 and probs[ip, 0] < 0.90):
                         for dp in [-1, 0, 1]:
                             pp = ip + dp
                             if hs <= pp <= he and sequence[pp] in COIL_BREAKERS and probs[pp, 0] < 0.95:
                                 boundary_positions.add(pp)
-                        # 对孤立breaker自己，无论邻居是否breaker都拉C
                         if seg_len >= 10:
                             boundary_positions.add(ip)
+
+        # v6.7新增：长段(>=12)内部"高Pβ连续区域"分裂检测
+        # 真实蛋白质中，长螺旋段中间如果出现连续3+个高Pβ残基（如V,I,L连续出现），
+        # 往往标志着一个coil转折区域（这些残基虽然Pα也>1，但Pβ更高暗示链倾向）
+        # 典型场景：Myoglobin pos14-16(KVE: K=1.16/0.74, V=1.06/1.70, E=1.51/0.37)
+        #   V的Pβ=1.70远超Pα=1.06，但K和E的Pα更高，所以纯CF算不出这是转折
+        # 策略：在长段中找"Pβ/Pα比值>1.2的残基连续2+"出现的区域，弱化H
+        if seg_len >= 12:
+            # 扫描段内部（不含首尾3个残基），找连续的"β倾向高于α倾向"区域
+            beta_dominant_run = 0
+            run_start = -1
+            for ip in range(hs + 3, he - 2):
+                aa = sequence[ip]
+                if aa in CHOU_FASMAN:
+                    pa, pb, pc = CHOU_FASMAN[aa]
+                    # 残基的β倾向明显高于α倾向（比值>1.3）或Pc高（>1.2）
+                    is_turn_point = (pb / max(pa, 0.01) > 1.3) or (pc > 1.2)
+                else:
+                    is_turn_point = False
+
+                if is_turn_point:
+                    if beta_dominant_run == 0:
+                        run_start = ip
+                    beta_dominant_run += 1
+                else:
+                    # 连续区域结束，检查长度
+                    if beta_dominant_run >= 2:
+                        # 找到一个转折候选区域
+                        for pp in range(run_start, run_start + beta_dominant_run):
+                            if probs[pp, 0] < 0.88:
+                                probs[pp, 0] *= 0.62
+                                probs[pp, 2] *= 1.35
+                                probs[pp] = probs[pp] / probs[pp].sum()
+                    beta_dominant_run = 0
+                    run_start = -1
+            # 处理末尾残留
+            if beta_dominant_run >= 2:
+                for pp in range(run_start, run_start + beta_dominant_run):
+                    if probs[pp, 0] < 0.88:
+                        probs[pp, 0] *= 0.62
+                        probs[pp, 2] *= 1.35
+                        probs[pp] = probs[pp] / probs[pp].sum()
 
         for edge_pos in boundary_positions:
             if 0 <= edge_pos < n:
                 aa = sequence[edge_pos]
                 if aa in COIL_BREAKERS:
-                    # 高Pc残基(G/P/S/D/N)在H段边界 → 强制削弱H, 增强C
                     ph = probs[edge_pos, 0]
-                    # 降低门槛：只要不是极端主导(0.92以下)都削尖（原来0.82太低）
                     if ph < 0.92:
                         probs[edge_pos, 0] *= 0.70
                         probs[edge_pos, 2] *= 1.28

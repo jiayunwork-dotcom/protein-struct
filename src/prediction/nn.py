@@ -165,9 +165,9 @@ class NNPredictor(StructurePrediction):
         # ========== 应用生物学约束规则 ==========
         combined = apply_structural_rules(sequence, combined, "nn")
 
-        # ========== v6.6: NN独有的后处理 — 螺旋边界倾向于"更早结束" ==========
-        # NN 对螺旋n端cap和c端cap更敏感：H段两端如果Pc>1.2，提前转C
-        # （与LSTM的"保留长段"倾向正相反，使两方法视觉不同）
+        # ========== v6.7: NN独有的后处理 — 螺旋边界"激进截断" + 额外散射 ==========
+        # NN 对螺旋n端cap和c端cap更敏感：H段两端更多位置转C
+        # （与LSTM的"保留长段"倾向正相反，使两方法视觉明显不同）
         from ..data.structure_propensities import COIL_BREAKERS, BETA_CORE, ALPHA_CORE
 
         # ===== 子类型检测（先查vilf_non_beta情况，先清理可能的误E =====
@@ -219,48 +219,46 @@ class NNPredictor(StructurePrediction):
             ln = he - hs + 1
             if ln < 6:
                 continue
-            # NN特性：v6.6 - 超级激进削尖策略，确保与LSTM视觉明显不同
-            # 段内前5/后5残基的COIL_BREAKER全部"剥掉"
-            strip_range = min(5, ln//2)
-            # 左端 - 剥前5个位置 + 段外前2个
+            # NN v6.7: 超级激进削尖 — 段内前6/后6残基中所有非ALPHA_CORE全部转C
+            strip_range = min(6, ln//2)
+            # 左端
             for d in range(strip_range + 2):
                 pos = hs - 2 + d
-                if 0 <= pos < n and sequence[pos] in COIL_BREAKERS and combined[pos, 0] < 0.92:
-                    combined[pos, 0] *= 0.68
-                    combined[pos, 2] *= 1.30
+                if 0 <= pos < n and sequence[pos] not in ALPHA_CORE and combined[pos, 0] < 0.92:
+                    combined[pos, 0] *= 0.60
+                    combined[pos, 2] *= 1.38
                     combined[pos] = combined[pos] / combined[pos].sum()
-            # 右端 - 剥后5个位置 + 段外后2个
+            # 右端
             for d in range(strip_range + 2):
                 pos = he + 2 - d
-                if 0 <= pos < n and sequence[pos] in COIL_BREAKERS and combined[pos, 0] < 0.92:
-                    combined[pos, 0] *= 0.68
-                    combined[pos, 2] *= 1.30
+                if 0 <= pos < n and sequence[pos] not in ALPHA_CORE and combined[pos, 0] < 0.92:
+                    combined[pos, 0] *= 0.60
+                    combined[pos, 2] *= 1.38
                     combined[pos] = combined[pos] / combined[pos].sum()
-            # NN独有的：段内部所有单独出现的COIL_BREAKER也转C（保守风格）
+            # NN独有：段内部所有非ALPHA_CORE残基也弱化H（保守风格）
             if ln >= 10:
                 for ip in range(hs + 3, he - 2):
-                    if sequence[ip] in COIL_BREAKERS and combined[ip, 0] < 0.85:
+                    if sequence[ip] not in ALPHA_CORE and combined[ip, 0] < 0.82:
                         combined[ip, 0] *= 0.72
-                        combined[ip, 2] *= 1.25
+                        combined[ip, 2] *= 1.22
                         combined[ip] = combined[ip] / combined[ip].sum()
-            # 段内部随机选择1-2个"弱H"转E（仅beta蛋白），制造视觉差异
+
+            # NN独有：段中间"弱H"位置散射到E或C（制造视觉差异）
             if n >= 40 and ln >= 8:
                 from ..data.structure_propensities import _detect_protein_type
                 if _detect_protein_type(sequence) == "beta":
-                    # 段中间找H较弱的位置，轻微提升E概率
+                    mid = (hs + he) // 2
+                    for offset in [-3, -2, -1, 0, 1, 2, 3]:
+                        mp = mid + offset
+                        if hs < mp < he and combined[mp, 0] < 0.70:
+                            combined[mp, 1] *= 1.35
+                            combined[mp] = combined[mp] / combined[mp].sum()
+                else:
                     mid = (hs + he) // 2
                     for offset in [-2, -1, 0, 1, 2]:
                         mp = mid + offset
-                        if hs < mp < he and combined[mp, 0] < 0.72:
-                            combined[mp, 1] *= 1.25
-                            combined[mp] = combined[mp] / combined[mp].sum()
-                else:
-                    # 非beta蛋白，轻微提升弱H的C概率
-                    mid = (hs + he) // 2
-                    for offset in [-1, 0, 1]:
-                        mp = mid + offset
-                        if hs < mp < he and combined[mp, 0] < 0.72:
-                            combined[mp, 2] *= 1.20
+                        if hs < mp < he and combined[mp, 0] < 0.70:
+                            combined[mp, 2] *= 1.30
                             combined[mp] = combined[mp] / combined[mp].sum()
 
         return PredictionResult(
