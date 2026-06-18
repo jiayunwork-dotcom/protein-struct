@@ -83,13 +83,34 @@ def init_session_state():
         st.session_state.heatmap_clicked_pos = {}
 
 
-def _on_heatmap_click(sid, event):
-    if event is None or "points" not in event or len(event["points"]) == 0:
+def _on_heatmap_select(sid, heatmap_key):
+    state = st.session_state.get(heatmap_key)
+    if state is None:
         return
-    pt = event["points"][0]
-    if "x" in pt:
-        pos = int(pt["x"])
-        st.session_state.heatmap_clicked_pos[sid] = pos
+    selection = None
+    if isinstance(state, dict):
+        selection = state.get("selection")
+    elif hasattr(state, "selection"):
+        selection = state.selection
+    if not selection:
+        return
+
+    points = None
+    if isinstance(selection, dict):
+        points = selection.get("points", [])
+    elif hasattr(selection, "points"):
+        points = selection.points
+    if not points or len(points) == 0:
+        return
+
+    pt = points[0]
+    pos_val = None
+    if isinstance(pt, dict):
+        pos_val = pt.get("x")
+    elif hasattr(pt, "x"):
+        pos_val = pt.x
+    if pos_val is not None:
+        st.session_state.heatmap_clicked_pos[sid] = int(pos_val)
 
 
 init_session_state()
@@ -421,7 +442,8 @@ def page_prediction():
                         hm_fig,
                         use_container_width=True,
                         key=heatmap_key,
-                        on_click=lambda ev, s=sid: _on_heatmap_click(s, ev),
+                        on_select=lambda s=sid, k=heatmap_key: _on_heatmap_select(s, k),
+                        selection_mode="points",
                     )
 
                     stat_cols = st.columns(len(results) + 1)
