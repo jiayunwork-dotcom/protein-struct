@@ -1054,14 +1054,14 @@ def page_conservation():
         total_variable_span = sum(r["length"] for r in conservation_result.variable_regions)
 
         metrics_data = [
-            {"Metric": "Total Columns", "Value": total_cols},
-            {"Metric": "Valid Columns (non-all-gap)", "Value": f"{valid_cols} ({valid_cols/total_cols*100:.1f}%)" if total_cols > 0 else valid_cols},
+            {"Metric": "Total Columns", "Value": str(total_cols)},
+            {"Metric": "Valid Columns (non-all-gap)", "Value": f"{valid_cols} ({valid_cols/total_cols*100:.1f}%)" if total_cols > 0 else str(valid_cols)},
             {"Metric": "Average Shannon Entropy", "Value": f"{avg_entropy:.4f}"},
             {"Metric": "Median Shannon Entropy", "Value": f"{median_entropy:.4f}"},
             {"Metric": "Conserved Regions", "Value": f"{len(conservation_result.conserved_regions)} regions, {total_conserved_span} cols"},
             {"Metric": "Variable Hotspots", "Value": f"{len(conservation_result.variable_regions)} regions, {total_variable_span} cols"},
         ]
-        st.dataframe(pd.DataFrame(metrics_data), use_container_width=True, hide_index=True)
+        st.dataframe(pd.DataFrame(metrics_data).astype(str), use_container_width=True, hide_index=True)
 
         if conservation_result.conserved_regions:
             st.markdown("#### 🟢 Conserved Regions")
@@ -1070,11 +1070,11 @@ def page_conservation():
                 conserved_data.append({
                     "ID": f"C{reg['id']}",
                     "Columns": f"{reg['start']+1}-{reg['end']+1}",
-                    "Span": reg["length"],
+                    "Span": str(reg["length"]),
                     "Avg Entropy": f"{reg['avg_entropy']:.4f}",
                     "Consensus": reg["consensus_sequence"],
                 })
-            st.dataframe(pd.DataFrame(conserved_data), use_container_width=True, hide_index=True)
+            st.dataframe(pd.DataFrame(conserved_data).astype(str), use_container_width=True, hide_index=True)
 
         if conservation_result.variable_regions:
             st.markdown("#### 🔴 Variable Hotspots")
@@ -1083,11 +1083,11 @@ def page_conservation():
                 variable_data.append({
                     "ID": f"V{reg['id']}",
                     "Columns": f"{reg['start']+1}-{reg['end']+1}",
-                    "Span": reg["length"],
+                    "Span": str(reg["length"]),
                     "Avg Entropy": f"{reg['avg_entropy']:.4f}",
                     "Consensus": reg["consensus_sequence"],
                 })
-            st.dataframe(pd.DataFrame(variable_data), use_container_width=True, hide_index=True)
+            st.dataframe(pd.DataFrame(variable_data).astype(str), use_container_width=True, hide_index=True)
 
     with stat_col2:
         hist_fig = plot_entropy_histogram(valid_entropies)

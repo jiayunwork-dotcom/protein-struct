@@ -30,24 +30,24 @@ def plot_conservation_profile(
         fig.add_vrect(
             x0=reg["start"] + 1,
             x1=reg["end"] + 1,
-            fillcolor="rgba(46, 204, 113, 0.25)",
-            line=dict(color="rgba(46, 204, 113, 0.8)", width=1),
+            fillcolor="rgba(46, 204, 113, 0.4)",
+            line=dict(color="rgba(39, 174, 96, 1.0)", width=2),
             layer="below",
             annotation_text=f"C{reg['id']}",
             annotation_position="top left",
-            annotation_font=dict(color="#27AE60", size=10),
+            annotation_font=dict(color="#27AE60", size=11, weight="bold"),
         )
 
     for reg in conservation_result.variable_regions:
         fig.add_vrect(
             x0=reg["start"] + 1,
             x1=reg["end"] + 1,
-            fillcolor="rgba(231, 76, 60, 0.25)",
-            line=dict(color="rgba(231, 76, 60, 0.8)", width=1),
+            fillcolor="rgba(231, 76, 60, 0.4)",
+            line=dict(color="rgba(192, 57, 43, 1.0)", width=2),
             layer="below",
             annotation_text=f"V{reg['id']}",
             annotation_position="top left",
-            annotation_font=dict(color="#C0392B", size=10),
+            annotation_font=dict(color="#C0392B", size=11, weight="bold"),
         )
 
     hover_texts = []
@@ -143,19 +143,23 @@ def plot_entropy_histogram(shannon_entropy: np.ndarray) -> go.Figure:
     fig = go.Figure()
     fig.add_trace(go.Histogram(
         x=shannon_entropy,
-        nbinsx=20,
+        xbins=dict(
+            start=0.0,
+            end=1.0,
+            size=0.05,
+        ),
         marker=dict(
             color="#3498DB",
             line=dict(color="#2980B9", width=1),
         ),
-        opacity=0.8,
+        opacity=0.85,
     ))
 
     fig.update_layout(
-        title="Entropy Distribution",
+        title="Entropy Distribution (20 bins)",
         xaxis_title="Shannon Entropy",
         yaxis_title="Column Count",
-        xaxis=dict(range=[0, 1], dtick=0.2, gridcolor="#ECF0F1"),
+        xaxis=dict(range=[-0.02, 1.02], dtick=0.2, gridcolor="#ECF0F1"),
         yaxis=dict(gridcolor="#ECF0F1"),
         height=350,
         plot_bgcolor="#FAFAFA",
