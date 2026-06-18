@@ -11,6 +11,10 @@ from .alignment_viz import (
     COLOR_SCHEMES,
     plot_sequence_logo,
 )
+from .conservation_viz import (
+    plot_conservation_profile,
+    plot_entropy_histogram,
+)
 
 __all__ = [
     "plot_structure_prediction",
@@ -22,4 +26,6 @@ __all__ = [
     "plot_alignment",
     "COLOR_SCHEMES",
     "plot_sequence_logo",
+    "plot_conservation_profile",
+    "plot_entropy_histogram",
 ]

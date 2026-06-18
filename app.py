@@ -37,6 +37,8 @@ from src.alignment import (
     progressive_alignment,
     AlignmentResult,
     MultipleAlignmentResult,
+    analyze_conservation,
+    ConservationResult,
 )
 from src.visualization import (
     plot_structure_prediction,
@@ -48,6 +50,8 @@ from src.visualization import (
     plot_alignment,
     plot_sequence_logo,
     COLOR_SCHEMES,
+    plot_conservation_profile,
+    plot_entropy_histogram,
 )
 from src.evaluation import (
     compute_q3,
@@ -914,6 +918,192 @@ def page_evaluation():
         st.dataframe(pd.DataFrame(per_protein), use_container_width=True, hide_index=True)
 
 
+def generate_regions_csv(conservation_result: ConservationResult) -> str:
+    rows = []
+    for reg in conservation_result.conserved_regions:
+        rows.append({
+            "region_id": f"C{reg['id']}",
+            "type": "conserved",
+            "start_col": reg["start"] + 1,
+            "end_col": reg["end"] + 1,
+            "span": reg["length"],
+            "avg_entropy": f"{reg['avg_entropy']:.4f}",
+            "max_entropy": f"{reg['max_entropy']:.4f}",
+            "min_entropy": f"{reg['min_entropy']:.4f}",
+            "consensus_sequence": reg["consensus_sequence"],
+        })
+    for reg in conservation_result.variable_regions:
+        rows.append({
+            "region_id": f"V{reg['id']}",
+            "type": "variable",
+            "start_col": reg["start"] + 1,
+            "end_col": reg["end"] + 1,
+            "span": reg["length"],
+            "avg_entropy": f"{reg['avg_entropy']:.4f}",
+            "max_entropy": f"{reg['max_entropy']:.4f}",
+            "min_entropy": f"{reg['min_entropy']:.4f}",
+            "consensus_sequence": reg["consensus_sequence"],
+        })
+    if not rows:
+        return "region_id,type,start_col,end_col,span,avg_entropy,max_entropy,min_entropy,consensus_sequence\n"
+    return pd.DataFrame(rows).to_csv(index=False)
+
+
+def page_conservation():
+    st.header("🛡️ Conservation Analysis")
+    st.markdown(
+        "Analyze sequence conservation and variable hotspots from a multiple sequence alignment (MSA). "
+        "Computes Shannon entropy, BLOSUM62-weighted conservation scores, and identifies conserved regions and mutation hotspots."
+    )
+
+    if st.session_state.msa_result is None:
+        st.warning("⚠️ Please run Multiple Sequence Alignment (MSA) first in the '📊 Multiple Alignment' page.")
+        return
+
+    result: MultipleAlignmentResult = st.session_state.msa_result
+
+    st.subheader("⚙️ Parameters")
+    col_param1, col_param2, col_param3 = st.columns(3)
+    with col_param1:
+        window_size = st.slider(
+            "Smoothing Window Size",
+            min_value=1,
+            max_value=21,
+            value=7,
+            step=2,
+            help="Sliding window size for entropy smoothing (odd number recommended)",
+        )
+    with col_param2:
+        conserved_threshold = st.slider(
+            "Conserved Region Threshold",
+            min_value=0.0,
+            max_value=1.0,
+            value=0.3,
+            step=0.05,
+            help="Smoothed entropy below this value is considered conserved",
+        )
+    with col_param3:
+        variable_threshold = st.slider(
+            "Variable Hotspot Threshold",
+            min_value=0.0,
+            max_value=1.0,
+            value=0.7,
+            step=0.05,
+            help="Smoothed entropy above this value is considered a variable hotspot",
+        )
+
+    if variable_threshold <= conserved_threshold:
+        st.error("❌ Variable threshold must be greater than conserved threshold.")
+        return
+
+    with st.spinner("Analyzing conservation..."):
+        conservation_result = analyze_conservation(
+            result.aligned_sequences,
+            window_size=window_size,
+            conserved_threshold=conserved_threshold,
+            variable_threshold=variable_threshold,
+        )
+
+    st.divider()
+    st.subheader("📈 Conservation Profile")
+    profile_fig = plot_conservation_profile(
+        conservation_result,
+        conserved_threshold=conserved_threshold,
+        variable_threshold=variable_threshold,
+    )
+    st.plotly_chart(profile_fig, use_container_width=True)
+
+    st.divider()
+    st.subheader("🎯 Sequence Logo")
+    logo_full = st.checkbox("Show Full Alignment Logo", value=False)
+    if logo_full:
+        logo_fig = plot_sequence_logo(
+            result.aligned_sequences,
+            full=True,
+        )
+    else:
+        logo_view_start = st.slider(
+            "Logo View Start:",
+            0, max(0, conservation_result.total_columns - 1), 0,
+            key="logo_view_start",
+        )
+        logo_fig = plot_sequence_logo(
+            result.aligned_sequences,
+            start_col=logo_view_start,
+            end_col=min(logo_view_start + 40, conservation_result.total_columns),
+            full=False,
+        )
+    st.plotly_chart(logo_fig, use_container_width=True)
+
+    st.divider()
+    st.subheader("📊 Statistical Summary")
+
+    stat_col1, stat_col2 = st.columns([1, 1])
+
+    with stat_col1:
+        st.markdown("#### 📋 Basic Statistics")
+        total_cols = conservation_result.total_columns
+        valid_cols = conservation_result.valid_columns
+        valid_entropies = conservation_result.shannon_entropy[
+            [i for i, c in enumerate(conservation_result.column_amino_acid_counts) if sum(c.values()) > 0]
+        ]
+        avg_entropy = float(np.mean(valid_entropies)) if len(valid_entropies) > 0 else 0.0
+        median_entropy = float(np.median(valid_entropies)) if len(valid_entropies) > 0 else 0.0
+
+        total_conserved_span = sum(r["length"] for r in conservation_result.conserved_regions)
+        total_variable_span = sum(r["length"] for r in conservation_result.variable_regions)
+
+        metrics_data = [
+            {"Metric": "Total Columns", "Value": total_cols},
+            {"Metric": "Valid Columns (non-all-gap)", "Value": f"{valid_cols} ({valid_cols/total_cols*100:.1f}%)" if total_cols > 0 else valid_cols},
+            {"Metric": "Average Shannon Entropy", "Value": f"{avg_entropy:.4f}"},
+            {"Metric": "Median Shannon Entropy", "Value": f"{median_entropy:.4f}"},
+            {"Metric": "Conserved Regions", "Value": f"{len(conservation_result.conserved_regions)} regions, {total_conserved_span} cols"},
+            {"Metric": "Variable Hotspots", "Value": f"{len(conservation_result.variable_regions)} regions, {total_variable_span} cols"},
+        ]
+        st.dataframe(pd.DataFrame(metrics_data), use_container_width=True, hide_index=True)
+
+        if conservation_result.conserved_regions:
+            st.markdown("#### 🟢 Conserved Regions")
+            conserved_data = []
+            for reg in conservation_result.conserved_regions:
+                conserved_data.append({
+                    "ID": f"C{reg['id']}",
+                    "Columns": f"{reg['start']+1}-{reg['end']+1}",
+                    "Span": reg["length"],
+                    "Avg Entropy": f"{reg['avg_entropy']:.4f}",
+                    "Consensus": reg["consensus_sequence"],
+                })
+            st.dataframe(pd.DataFrame(conserved_data), use_container_width=True, hide_index=True)
+
+        if conservation_result.variable_regions:
+            st.markdown("#### 🔴 Variable Hotspots")
+            variable_data = []
+            for reg in conservation_result.variable_regions:
+                variable_data.append({
+                    "ID": f"V{reg['id']}",
+                    "Columns": f"{reg['start']+1}-{reg['end']+1}",
+                    "Span": reg["length"],
+                    "Avg Entropy": f"{reg['avg_entropy']:.4f}",
+                    "Consensus": reg["consensus_sequence"],
+                })
+            st.dataframe(pd.DataFrame(variable_data), use_container_width=True, hide_index=True)
+
+    with stat_col2:
+        hist_fig = plot_entropy_histogram(valid_entropies)
+        st.plotly_chart(hist_fig, use_container_width=True)
+
+    st.divider()
+    csv_data = generate_regions_csv(conservation_result)
+    st.download_button(
+        "⬇️ Export Regions as CSV",
+        data=csv_data,
+        file_name="conservation_regions.csv",
+        mime="text/csv",
+        use_container_width=True,
+    )
+
+
 def main():
     st.title("🧬 Protein Structure Analysis Toolkit")
     st.markdown(
@@ -931,6 +1121,7 @@ def main():
             "🔮 Structure Prediction",
             "🔗 Pairwise Alignment",
             "📊 Multiple Alignment",
+            "🛡️ Conservation Analysis",
             "📐 Batch Evaluation",
         ],
     )
@@ -943,6 +1134,8 @@ def main():
         page_pairwise_alignment()
     elif page.startswith("📊"):
         page_msa()
+    elif page.startswith("🛡️"):
+        page_conservation()
     elif page.startswith("📐"):
         page_evaluation()
 
