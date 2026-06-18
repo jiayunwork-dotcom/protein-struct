@@ -37,9 +37,14 @@ def get_consensus_structure(
             consensus.append(preds_at_pos[0])
             is_agreement.append(True)
         else:
-            counter = Counter(preds_at_pos)
-            most_common = counter.most_common(1)[0][0]
-            consensus.append(most_common)
+            max_prob = -1.0
+            best_state = preds_at_pos[0]
+            for res in predictions:
+                prob = float(np.max(res.probabilities[pos]))
+                if prob > max_prob:
+                    max_prob = prob
+                    best_state = res.states[pos]
+            consensus.append(best_state)
             is_agreement.append(False)
 
     return consensus, is_agreement, all_preds
@@ -128,15 +133,18 @@ def plot_conservation_profile(
             region_text = f"<br><b>{rtype} Region</b>: {reg['id']} (cols {reg['start']+1}-{reg['end']+1})"
 
         struct_text = ""
-        if has_structure and consensus_struct and i < len(consensus_struct):
-            s = consensus_struct[i]
-            agree = struct_agreement[i] if struct_agreement else False
-            struct_name = STRUCTURE_NAMES.get(s, s)
-            if agree:
-                struct_text = f"<br><b>Structure</b>: {s} ({struct_name}) ✅ 3-method agreement"
+        if has_structure and consensus_struct:
+            if i < len(consensus_struct):
+                s = consensus_struct[i]
+                agree = struct_agreement[i] if struct_agreement else False
+                struct_name = STRUCTURE_NAMES.get(s, s)
+                if agree:
+                    struct_text = f"<br><b>Structure</b>: {s} ({struct_name}) ✅ 3-method agreement"
+                else:
+                    preds_str = ", ".join(struct_all_preds[i]) if struct_all_preds else "N/A"
+                    struct_text = f"<br><b>Structure</b>: {s} ({struct_name}) ❌ Disagreement [{preds_str}]"
             else:
-                preds_str = ", ".join(struct_all_preds[i]) if struct_all_preds else "N/A"
-                struct_text = f"<br><b>Structure</b>: {s} ({struct_name}) ❌ Disagreement [{preds_str}]"
+                struct_text = f"<br><b>Structure</b>: - (no prediction, sequence longer than prediction)"
 
         hover_text = (
             f"<b>Column {i+1}</b><br>"
@@ -218,14 +226,16 @@ def plot_conservation_profile(
 
     if has_structure and consensus_struct:
         for i in range(n_cols):
-            if i >= len(consensus_struct):
-                break
-            s = consensus_struct[i]
-            color = STRUCTURE_COLORS.get(s, "#95A5A6")
-            agree = struct_agreement[i] if struct_agreement else False
-
-            border_color = "#2C3E50" if not agree else color
-            border_width = 1.5 if not agree else 0.5
+            if i < len(consensus_struct):
+                s = consensus_struct[i]
+                color = STRUCTURE_COLORS.get(s, "#95A5A6")
+                agree = struct_agreement[i] if struct_agreement else False
+                border_color = "#2C3E50" if not agree else color
+                border_width = 1.5 if not agree else 0.5
+            else:
+                color = "#ECF0F1"
+                border_color = "#BDC3C7"
+                border_width = 0.5
 
             fig.add_trace(
                 go.Bar(
@@ -308,6 +318,13 @@ def plot_conservation_profile(
     return fig
 
 
+def _position_in_regions(pos: int, regions: List[Dict]) -> bool:
+    for reg in regions:
+        if reg["start"] <= pos <= reg["end"]:
+            return True
+    return False
+
+
 def compute_structure_conservation_stats(
     conservation_result: ConservationResult,
     consensus_structure: List[str],
@@ -316,6 +333,9 @@ def compute_structure_conservation_stats(
 ) -> Dict[str, Dict]:
     stats = {}
     n_cols = min(conservation_result.total_columns, len(consensus_structure))
+
+    conserved_regions = conservation_result.conserved_regions
+    variable_regions = conservation_result.variable_regions
 
     for s in STRUCTURE_STATES:
         indices = [i for i in range(n_cols) if consensus_structure[i] == s]
@@ -331,10 +351,9 @@ def compute_structure_conservation_stats(
 
         entropies = [conservation_result.shannon_entropy[i] for i in indices]
         weighted = [conservation_result.weighted_score[i] for i in indices]
-        smoothed = [conservation_result.smoothed_entropy[i] for i in indices]
 
-        n_conserved = sum(1 for v in smoothed if v < conserved_threshold)
-        n_variable = sum(1 for v in smoothed if v > variable_threshold)
+        n_conserved = sum(1 for i in indices if _position_in_regions(i, conserved_regions))
+        n_variable = sum(1 for i in indices if _position_in_regions(i, variable_regions))
 
         stats[s] = {
             "count": len(indices),
