@@ -79,6 +79,17 @@ def init_session_state():
         st.session_state.pairwise_result = None
     if "msa_result" not in st.session_state:
         st.session_state.msa_result = None
+    if "heatmap_clicked_pos" not in st.session_state:
+        st.session_state.heatmap_clicked_pos = {}
+
+
+def _on_heatmap_click(sid, event):
+    if event is None or "points" not in event or len(event["points"]) == 0:
+        return
+    pt = event["points"][0]
+    if "x" in pt:
+        pos = int(pt["x"])
+        st.session_state.heatmap_clicked_pos[sid] = pos
 
 
 init_session_state()
@@ -296,7 +307,7 @@ def page_prediction():
         st.subheader(f"📊 Results: {seq.name}")
 
         fig = plot_structure_prediction(results, sequence_name=seq.name)
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(fig, use_container_width=True, key=f"main_pred_{sid}")
 
         tab_vis1, tab_vis2, tab_vis3, tab_vis4, tab_vis5 = st.tabs([
             "📈 Composition", "📏 Helix Lengths", "🌀 Helical Wheel",
@@ -307,7 +318,11 @@ def page_prediction():
             for res in results:
                 col_a, col_b = st.columns(2)
                 with col_a:
-                    st.plotly_chart(plot_structure_composition(res, seq.name), use_container_width=True)
+                    st.plotly_chart(
+                        plot_structure_composition(res, seq.name),
+                        use_container_width=True,
+                        key=f"comp_{sid}_{res.method}",
+                    )
                 with col_b:
                     counts = {s: res.states.count(s) for s in STRUCTURE_STATES}
                     total = len(res.states) if res.states else 1
@@ -324,7 +339,11 @@ def page_prediction():
         with tab_vis2:
             for res in results:
                 st.markdown(f"**{res.method}**")
-                st.plotly_chart(plot_helix_length_distribution(res), use_container_width=True)
+                st.plotly_chart(
+                    plot_helix_length_distribution(res),
+                    use_container_width=True,
+                    key=f"helixlen_{sid}_{res.method}",
+                )
                 states = res.states
                 helices = []
                 start = None
@@ -358,12 +377,20 @@ def page_prediction():
         with tab_vis3:
             for res in results:
                 st.markdown(f"**{res.method}**")
-                st.plotly_chart(plot_helical_wheel(res), use_container_width=True)
+                st.plotly_chart(
+                    plot_helical_wheel(res),
+                    use_container_width=True,
+                    key=f"hwheel_{sid}_{res.method}",
+                )
 
         with tab_vis4:
             for res in results:
                 st.markdown(f"**{res.method}**")
-                st.plotly_chart(plot_ramachandran(res), use_container_width=True)
+                st.plotly_chart(
+                    plot_ramachandran(res),
+                    use_container_width=True,
+                    key=f"ramach_{sid}_{res.method}",
+                )
 
         with tab_vis5:
             for res in results:
@@ -389,7 +416,13 @@ def page_prediction():
                     results, sequence_name=seq.name
                 )
                 if hm_fig.data:
-                    st.plotly_chart(hm_fig, use_container_width=True)
+                    heatmap_key = f"heatmap_{sid}"
+                    st.plotly_chart(
+                        hm_fig,
+                        use_container_width=True,
+                        key=heatmap_key,
+                        on_click=lambda ev, s=sid: _on_heatmap_click(s, ev),
+                    )
 
                     stat_cols = st.columns(len(results) + 1)
                     for m_idx, res in enumerate(results):
@@ -408,15 +441,24 @@ def page_prediction():
                         )
 
                     st.markdown("---")
-                    st.markdown("**🔬 Residue Detail Explorer** — Select a position to inspect local context")
+                    st.markdown(
+                        "**🔬 Residue Detail Explorer** — Click any cell in the heatmap above, "
+                        "or use the slider below to fine-tune position."
+                    )
                     seq_len = len(results[0])
+                    default_pos = st.session_state.heatmap_clicked_pos.get(sid, 1)
+
                     selected_pos = st.slider(
                         "Residue Position:",
                         min_value=1,
                         max_value=seq_len,
-                        value=1,
+                        value=default_pos if 1 <= default_pos <= seq_len else 1,
                         key=f"conf_pos_{sid}",
                     )
+
+                    if sid in st.session_state.heatmap_clicked_pos:
+                        clicked = st.session_state.heatmap_clicked_pos[sid]
+                        st.info(f"🖱️ Last clicked position: **{clicked}** | Slider value: **{selected_pos}**")
 
                     center = selected_pos - 1
                     ctx_start = max(0, center - 5)
@@ -447,6 +489,10 @@ def page_prediction():
                             row["Consensus"] = f"✅ {consensus_char}"
                         else:
                             row["Consensus"] = "❓ ?"
+                        is_center = (pos_i == center)
+                        if is_center:
+                            for k in row:
+                                row[k] = f"👉 {row[k]}"
                         detail_rows.append(row)
 
                     st.dataframe(
