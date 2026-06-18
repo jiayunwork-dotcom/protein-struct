@@ -14,6 +14,12 @@ from .alignment_viz import (
 from .conservation_viz import (
     plot_conservation_profile,
     plot_entropy_histogram,
+    get_consensus_structure,
+    compute_structure_conservation_stats,
+    plot_structure_conservation_association,
+    detect_hotspot_boundary_overlap,
+    get_region_structure_info,
+    find_structure_boundaries,
 )
 
 __all__ = [
@@ -28,4 +34,10 @@ __all__ = [
     "plot_sequence_logo",
     "plot_conservation_profile",
     "plot_entropy_histogram",
+    "get_consensus_structure",
+    "compute_structure_conservation_stats",
+    "plot_structure_conservation_association",
+    "detect_hotspot_boundary_overlap",
+    "get_region_structure_info",
+    "find_structure_boundaries",
 ]

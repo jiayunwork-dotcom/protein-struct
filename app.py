@@ -52,6 +52,11 @@ from src.visualization import (
     COLOR_SCHEMES,
     plot_conservation_profile,
     plot_entropy_histogram,
+    get_consensus_structure,
+    compute_structure_conservation_stats,
+    plot_structure_conservation_association,
+    detect_hotspot_boundary_overlap,
+    get_region_structure_info,
 )
 from src.evaluation import (
     compute_q3,
@@ -85,6 +90,8 @@ def init_session_state():
         st.session_state.msa_result = None
     if "heatmap_clicked_pos" not in st.session_state:
         st.session_state.heatmap_clicked_pos = {}
+    if "conservation_selected_pos" not in st.session_state:
+        st.session_state.conservation_selected_pos = []
 
 
 def _on_heatmap_select(sid, heatmap_key):
@@ -115,6 +122,40 @@ def _on_heatmap_select(sid, heatmap_key):
         pos_val = pt.x
     if pos_val is not None:
         st.session_state.heatmap_clicked_pos[sid] = int(pos_val)
+
+
+def _on_conservation_select(conserv_key):
+    state = st.session_state.get(conserv_key)
+    if state is None:
+        return
+    selection = None
+    if isinstance(state, dict):
+        selection = state.get("selection")
+    elif hasattr(state, "selection"):
+        selection = state.selection
+    if not selection:
+        return
+
+    points = None
+    if isinstance(selection, dict):
+        points = selection.get("points", [])
+    elif hasattr(selection, "points"):
+        points = selection.points
+    if not points or len(points) == 0:
+        return
+
+    pos_vals = []
+    for pt in points:
+        pos_val = None
+        if isinstance(pt, dict):
+            pos_val = pt.get("x")
+        elif hasattr(pt, "x"):
+            pos_val = pt.x
+        if pos_val is not None:
+            pos_vals.append(int(pos_val))
+
+    if pos_vals:
+        st.session_state.conservation_selected_pos = sorted(set(pos_vals))
 
 
 init_session_state()
@@ -918,10 +959,15 @@ def page_evaluation():
         st.dataframe(pd.DataFrame(per_protein), use_container_width=True, hide_index=True)
 
 
-def generate_regions_csv(conservation_result: ConservationResult) -> str:
+def generate_regions_csv(
+    conservation_result: ConservationResult,
+    consensus_structure: Optional[List[str]] = None,
+) -> str:
     rows = []
+    has_struct = consensus_structure is not None and len(consensus_structure) > 0
+
     for reg in conservation_result.conserved_regions:
-        rows.append({
+        row = {
             "region_id": f"C{reg['id']}",
             "type": "conserved",
             "start_col": reg["start"] + 1,
@@ -931,9 +977,15 @@ def generate_regions_csv(conservation_result: ConservationResult) -> str:
             "max_entropy": f"{reg['max_entropy']:.4f}",
             "min_entropy": f"{reg['min_entropy']:.4f}",
             "consensus_sequence": reg["consensus_sequence"],
-        })
+        }
+        if has_struct:
+            dominant, boundary_count = get_region_structure_info(reg, consensus_structure)
+            row["dominant_structure"] = dominant
+            row["structure_boundary_overlap_count"] = boundary_count
+        rows.append(row)
+
     for reg in conservation_result.variable_regions:
-        rows.append({
+        row = {
             "region_id": f"V{reg['id']}",
             "type": "variable",
             "start_col": reg["start"] + 1,
@@ -943,9 +995,18 @@ def generate_regions_csv(conservation_result: ConservationResult) -> str:
             "max_entropy": f"{reg['max_entropy']:.4f}",
             "min_entropy": f"{reg['min_entropy']:.4f}",
             "consensus_sequence": reg["consensus_sequence"],
-        })
+        }
+        if has_struct:
+            dominant, boundary_count = get_region_structure_info(reg, consensus_structure)
+            row["dominant_structure"] = dominant
+            row["structure_boundary_overlap_count"] = boundary_count
+        rows.append(row)
+
     if not rows:
-        return "region_id,type,start_col,end_col,span,avg_entropy,max_entropy,min_entropy,consensus_sequence\n"
+        base_header = "region_id,type,start_col,end_col,span,avg_entropy,max_entropy,min_entropy,consensus_sequence"
+        if has_struct:
+            base_header += ",dominant_structure,structure_boundary_overlap_count"
+        return base_header + "\n"
     return pd.DataFrame(rows).to_csv(index=False)
 
 
@@ -961,6 +1022,7 @@ def page_conservation():
         return
 
     result: MultipleAlignmentResult = st.session_state.msa_result
+    seq_manager = st.session_state.seq_manager
 
     st.subheader("⚙️ Parameters")
     col_param1, col_param2, col_param3 = st.columns(3)
@@ -996,6 +1058,20 @@ def page_conservation():
         st.error("❌ Variable threshold must be greater than conserved threshold.")
         return
 
+    prediction_results = None
+    consensus_structure = None
+    struct_agreement = None
+    struct_all_preds = None
+
+    if st.session_state.predictions:
+        first_sid = None
+        for sid in st.session_state.predictions:
+            first_sid = sid
+            break
+        if first_sid and st.session_state.predictions[first_sid]:
+            prediction_results = st.session_state.predictions[first_sid]
+            consensus_structure, struct_agreement, struct_all_preds = get_consensus_structure(prediction_results)
+
     with st.spinner("Analyzing conservation..."):
         conservation_result = analyze_conservation(
             result.aligned_sequences,
@@ -1006,12 +1082,74 @@ def page_conservation():
 
     st.divider()
     st.subheader("📈 Conservation Profile")
+    conserv_key = "conservation_profile"
     profile_fig = plot_conservation_profile(
         conservation_result,
         conserved_threshold=conserved_threshold,
         variable_threshold=variable_threshold,
+        predictions=prediction_results,
     )
-    st.plotly_chart(profile_fig, use_container_width=True)
+    st.plotly_chart(
+        profile_fig,
+        use_container_width=True,
+        key=conserv_key,
+        on_select=lambda k=conserv_key: _on_conservation_select(k),
+        selection_mode="points",
+    )
+
+    if st.session_state.conservation_selected_pos:
+        st.markdown("#### 🔍 Selected Position Details")
+        selected = st.session_state.conservation_selected_pos
+        center = selected[0] - 1
+        ctx_start = max(0, center - 5)
+        ctx_end = min(conservation_result.total_columns, center + 6)
+
+        local_seq = "".join(
+            conservation_result.column_consensus[i]
+            for i in range(ctx_start, ctx_end)
+        )
+        st.markdown(
+            f"**Local Sequence** (positions {ctx_start + 1}–{ctx_end}): "
+            f"`{local_seq}`"
+        )
+
+        if consensus_structure:
+            local_struct = "".join(
+                consensus_structure[i] if i < len(consensus_structure) else "-"
+                for i in range(ctx_start, ctx_end)
+            )
+            st.markdown(
+                f"**Predicted Structure** (H=helix, E=sheet, C=coil): "
+                f"`{local_struct}`"
+            )
+
+        detail_rows = []
+        for offset_i, pos_i in enumerate(range(ctx_start, ctx_end)):
+            row = {
+                "Position": pos_i + 1,
+                "Residue": conservation_result.column_consensus[pos_i],
+                "Shannon Entropy": f"{conservation_result.shannon_entropy[pos_i]:.4f}",
+                "Weighted Score": f"{conservation_result.weighted_score[pos_i]:.4f}",
+            }
+            if consensus_structure and pos_i < len(consensus_structure):
+                s = consensus_structure[pos_i]
+                agree = struct_agreement[pos_i] if struct_agreement else False
+                if agree:
+                    row["Structure"] = f"{s} ✅"
+                else:
+                    preds_str = "/".join(struct_all_preds[pos_i]) if struct_all_preds else "?"
+                    row["Structure"] = f"{s} ❌ ({preds_str})"
+            is_center = (pos_i == center)
+            if is_center:
+                for k in row:
+                    row[k] = f"👉 {row[k]}"
+            detail_rows.append(row)
+
+        st.dataframe(
+            pd.DataFrame(detail_rows),
+            use_container_width=True,
+            hide_index=True,
+        )
 
     st.divider()
     st.subheader("🎯 Sequence Logo")
@@ -1067,34 +1205,110 @@ def page_conservation():
             st.markdown("#### 🟢 Conserved Regions")
             conserved_data = []
             for reg in conservation_result.conserved_regions:
-                conserved_data.append({
+                row = {
                     "ID": f"C{reg['id']}",
                     "Columns": f"{reg['start']+1}-{reg['end']+1}",
                     "Span": str(reg["length"]),
                     "Avg Entropy": f"{reg['avg_entropy']:.4f}",
                     "Consensus": reg["consensus_sequence"],
-                })
+                }
+                if consensus_structure:
+                    dominant, bcount = get_region_structure_info(reg, consensus_structure)
+                    row["Dominant Struct"] = dominant
+                    row["Boundary Overlaps"] = str(bcount)
+                conserved_data.append(row)
             st.dataframe(pd.DataFrame(conserved_data).astype(str), use_container_width=True, hide_index=True)
 
         if conservation_result.variable_regions:
             st.markdown("#### 🔴 Variable Hotspots")
             variable_data = []
             for reg in conservation_result.variable_regions:
-                variable_data.append({
+                row = {
                     "ID": f"V{reg['id']}",
                     "Columns": f"{reg['start']+1}-{reg['end']+1}",
                     "Span": str(reg["length"]),
                     "Avg Entropy": f"{reg['avg_entropy']:.4f}",
                     "Consensus": reg["consensus_sequence"],
-                })
+                }
+                if consensus_structure:
+                    dominant, bcount = get_region_structure_info(reg, consensus_structure)
+                    row["Dominant Struct"] = dominant
+                    row["Boundary Overlaps"] = str(bcount)
+                variable_data.append(row)
             st.dataframe(pd.DataFrame(variable_data).astype(str), use_container_width=True, hide_index=True)
 
     with stat_col2:
         hist_fig = plot_entropy_histogram(valid_entropies)
         st.plotly_chart(hist_fig, use_container_width=True)
 
+    if consensus_structure:
+        st.divider()
+        st.subheader("🧬 Structure-Conservation Association")
+
+        struct_stats = compute_structure_conservation_stats(
+            conservation_result,
+            consensus_structure,
+            conserved_threshold=conserved_threshold,
+            variable_threshold=variable_threshold,
+        )
+
+        assoc_col1, assoc_col2 = st.columns([1, 1])
+        with assoc_col1:
+            assoc_table_data = []
+            for s in STRUCTURE_STATES:
+                stat = struct_stats.get(s, {})
+                assoc_table_data.append({
+                    "Structure": f"{STRUCTURE_NAMES[s]} ({s})",
+                    "Count": stat.get("count", 0),
+                    "Avg Entropy": f"{stat.get('avg_entropy', 0.0):.4f}",
+                    "Avg Weighted": f"{stat.get('avg_weighted', 0.0):.4f}",
+                    "% Conserved": f"{stat.get('pct_conserved', 0.0):.1f}%",
+                    "% Variable": f"{stat.get('pct_variable', 0.0):.1f}%",
+                })
+            st.dataframe(pd.DataFrame(assoc_table_data), use_container_width=True, hide_index=True)
+
+        with assoc_col2:
+            assoc_fig = plot_structure_conservation_association(struct_stats)
+            st.plotly_chart(assoc_fig, use_container_width=True)
+
+        with st.expander("🔺 Hotspot - Structure Boundary Analysis", expanded=True):
+            boundary_results = detect_hotspot_boundary_overlap(
+                conservation_result,
+                consensus_structure,
+                boundary_window=2,
+                overlap_threshold=0.5,
+            )
+
+            if not boundary_results:
+                st.info("No variable hotspots detected or no structure data available.")
+            else:
+                boundary_hotspots = [b for b in boundary_results if b["is_boundary_hotspot"]]
+                if boundary_hotspots:
+                    st.warning(
+                        f"⚠️ **{len(boundary_hotspots)} Boundary-Associated Hotspot(s)** detected "
+                        f"(≥50% positions near structure transitions)"
+                    )
+
+                boundary_table_data = []
+                for br in boundary_results:
+                    positions_str = (
+                        ", ".join(str(p) for p in br["overlap_positions"][:10])
+                        + ("..." if len(br["overlap_positions"]) > 10 else "")
+                    ) if br["overlap_positions"] else "-"
+                    label = "✅ Boundary Hotspot" if br["is_boundary_hotspot"] else "No"
+                    boundary_table_data.append({
+                        "Hotspot": br["region_id"],
+                        "Columns": f"{br['start_col']}-{br['end_col']}",
+                        "Region Length": br["region_len"],
+                        "Overlap Count": br["overlap_count"],
+                        "Overlap %": f"{br['overlap_ratio']*100:.1f}%",
+                        "Boundary-Associated": label,
+                        "Overlap Positions": positions_str,
+                    })
+                st.dataframe(pd.DataFrame(boundary_table_data), use_container_width=True, hide_index=True)
+
     st.divider()
-    csv_data = generate_regions_csv(conservation_result)
+    csv_data = generate_regions_csv(conservation_result, consensus_structure)
     st.download_button(
         "⬇️ Export Regions as CSV",
         data=csv_data,
